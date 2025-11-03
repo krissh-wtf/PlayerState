@@ -14,10 +14,19 @@ A modern player data management system for Roblox games featuring ProfileService
 
 ## Installation
 
-### Option 1: Git Clone
-git clone https://github.com/YOURUSERNAME/PlayerState.gitDrag the `PlayerState` folder from `src/ReplicatedStorage/` into your game's ReplicatedStorage.
+### Option 1: Manual Installation
+
+1. Clone or download this repository
+```bash
+git clone https://github.com/YOURUSERNAME/PlayerState.git
+```
+
+2. Open your Roblox game in Studio
+3. In ReplicatedStorage, make sure the folder is named `PlayerState`
+4. The require path will be: `game.ReplicatedStorage.PlayerState.PlayerStateServer`
 
 ### Option 2: GitHub Cloning Plugin
+
 Use the [GitHub Cloning Plugin](https://devforum.roblox.com/t/github-cloning-plugin/31267) to clone directly into Roblox Studio.
 
 ## Quick Start
@@ -26,6 +35,7 @@ Use the [GitHub Cloning Plugin](https://devforum.roblox.com/t/github-cloning-plu
 
 Edit `DefaultData.luau` to define your player data:
 
+```lua
 return {
     Coins = 0,
     Level = 1,
@@ -39,14 +49,18 @@ return {
         ["💰 Coins"] = "Coins",
         ["⭐ Level"] = "Level"
     }
-}### 2. Configure Settings
+}
+```
+
+### 2. Configure Settings
 
 Edit `PlayerStateConfig.luau` for your game settings:
 
+```lua
 local Config = {
     Server = {
         DataStore = {
-            Name = "PlayerData_v1",  -- Change per version
+            Name = "PlayerData_v1",
             Scope = "Production"
         },
         
@@ -55,8 +69,14 @@ local Config = {
             TrackedStats = {"Coins", "Level"}
         }
     }
-}### 3. Initialize on Server
+}
 
+return Config
+```
+
+### 3. Initialize on Server
+
+```lua
 local Players = game:GetService("Players")
 local PlayerState = require(ReplicatedStorage.PlayerState.PlayerStateServer)
 
@@ -70,21 +90,30 @@ end)
 
 Players.PlayerRemoving:Connect(function(player)
     PlayerState.SaveData(player)
-end)### 4. Use on Client
+end)
+```
 
+### 4. Use on Client
+
+```lua
 local PlayerState = require(ReplicatedStorage.PlayerState.PlayerStateClient)
 
 -- Wait for data to load
-PlayerState.IsReady()  -- Check if ready
+PlayerState.IsReady() -- Check if ready
 
 -- Listen for changes
 PlayerState.OnChanged("Coins", function(newValue, oldValue)
     print(`Coins: {oldValue} → {newValue}`)
-end)## API Reference
+end)
+```
+
+## API Reference
 
 ### Server API
 
 #### Basic Operations
+
+```lua
 -- Set a value
 PlayerState.Set(player, "Coins", 100)
 
@@ -93,7 +122,12 @@ local coins = PlayerState.Get(player, "Coins")
 
 -- Access nested data with dot notation
 PlayerState.SetPath(player, "Inventory.Weapons[1].Durability", 95)
-local durability = PlayerState.GetPath(player, "Inventory.Weapons[1].Durability")#### Increment/Decrement
+local durability = PlayerState.GetPath(player, "Inventory.Weapons[1].Durability")
+```
+
+#### Increment/Decrement
+
+```lua
 -- Increment by 1
 PlayerState.Increment(player, "Coins")
 
@@ -101,7 +135,12 @@ PlayerState.Increment(player, "Coins")
 PlayerState.Increment(player, "Level", 5)
 
 -- Decrement
-PlayerState.Decrement(player, "Coins", 10)#### Arrays
+PlayerState.Decrement(player, "Coins", 10)
+```
+
+#### Arrays
+
+```lua
 -- Add item to array
 PlayerState.AddToArray(player, "Inventory.Weapons", {
     Id = "sword_001",
@@ -113,11 +152,16 @@ PlayerState.AddToArray(player, "Inventory.Weapons", {
 PlayerState.UpdateArrayItem(player, "Inventory.Weapons", 1, {
     Id = "sword_001",
     Name = "Iron Sword",
-    Damage = 15  -- Updated
+    Damage = 15
 })
 
 -- Remove from array
-PlayerState.RemoveFromArray(player, "Inventory.Weapons", 1)#### Dictionaries
+PlayerState.RemoveFromArray(player, "Inventory.Weapons", 1)
+```
+
+#### Dictionaries
+
+```lua
 -- Set dictionary value
 PlayerState.SetInDict(player, "Inventory.Items", "health_potion", 5)
 
@@ -125,7 +169,12 @@ PlayerState.SetInDict(player, "Inventory.Items", "health_potion", 5)
 local quantity = PlayerState.GetFromDict(player, "Inventory.Items", "health_potion")
 
 -- Remove from dictionary
-PlayerState.RemoveFromDict(player, "Inventory.Items", "health_potion")#### Batch Operations
+PlayerState.RemoveFromDict(player, "Inventory.Items", "health_potion")
+```
+
+#### Batch Operations
+
+```lua
 -- Update multiple values at once
 PlayerState.BatchSetValues(player, {
     {path = "Coins", value = 200},
@@ -134,17 +183,23 @@ PlayerState.BatchSetValues(player, {
 })
 
 -- Manually flush batch (normally auto-flushes)
-PlayerState.FlushBatch(player)#### Leaderboards
--- Update leaderboard stat (automatic on Set/SetPath)
-local coins = PlayerState.Get(player, "Coins")
-PlayerState.UpdateLeaderboard(player, "Coins", coins)
+PlayerState.FlushBatch(player)
+```
 
+#### Leaderboards
+
+```lua
 -- Get top players
 local topPlayers = PlayerState.GetLeaderboard("Coins", 10)
 -- Returns: {{userId = 123, score = 5000, rank = 1}, ...}
 
 -- Get player's rank
-local rank = PlayerState.GetPlayerRank(player, "Coins")#### Events
+local rank = PlayerState.GetPlayerRank(player, "Coins")
+```
+
+#### Events
+
+```lua
 -- Before data is saved
 PlayerState.BeforeSave:Connect(function(player, data)
     -- Validate or modify data before saving
@@ -158,7 +213,12 @@ end)
 -- When player leaves
 PlayerState.ProfileUnloaded:Connect(function(player, data)
     print("Data saved for", player.Name)
-end)#### Utilities
+end)
+```
+
+#### Utilities
+
+```lua
 -- Get all player data
 local allData = PlayerState.GetAll(player)
 
@@ -170,14 +230,15 @@ end
 -- Save data manually
 PlayerState.SaveData(player)
 
--- Get offline player data (no replication)
-local data = PlayerState.GetOfflineData(userId)
-
 -- Admin: Wipe player data
 PlayerState.WipePlayerData(player)
-PlayerState.WipeOfflinePlayerData(userId)### Client API
+```
+
+### Client API
 
 #### Reading Data
+
+```lua
 -- Get value
 local coins = PlayerState.Get("Coins")
 
@@ -188,7 +249,12 @@ local durability = PlayerState.GetPath("Inventory.Weapons[1].Durability")
 local quantity = PlayerState.GetFromDict("Inventory.Items", "health_potion")
 
 -- Get all data
-local allData = PlayerState.GetAll()#### Listening for Changes
+local allData = PlayerState.GetAll()
+```
+
+#### Listening for Changes
+
+```lua
 -- Listen to any path
 PlayerState.OnChanged("Coins", function(newValue, oldValue)
     print(`Coins changed: {oldValue} → {newValue}`)
@@ -196,7 +262,12 @@ end)
 
 PlayerState.OnChanged("Inventory.Weapons", function(newValue, oldValue)
     print("Weapons updated!")
-end)#### Utilities
+end)
+```
+
+#### Utilities
+
+```lua
 -- Check if data is ready
 if PlayerState.IsReady() then
     -- Data loaded
@@ -206,7 +277,10 @@ end
 PlayerState.ClearCache()
 
 -- Get underlying Replica (advanced)
-local replica = PlayerState.GetReplica()## Attribution
+local replica = PlayerState.GetReplica()
+```
+
+## Attribution
 
 This library uses the following third-party dependencies (included):
 
