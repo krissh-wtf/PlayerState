@@ -21,12 +21,16 @@ local Config = {
 			-- DataStore name (change for different versions/environments)
 			Name = "PlayerData_0.01",
 
-			-- Scope: "Production" for live data, "Testing" for mock data
+			-- Scope: "Production" for live data, "Testing" for mock data that won't save
 			Scope = "Production",
 		},
 
 		-- If it will remove fields not in template during data reconciliation
 		CleanExtraFields = false,
+
+		-- If enabled, Get/GetPath/GetFromDict will return deep copies of tables instead of references
+		-- This can be resource heavy so I would not recommend enabling it unless you really need it
+		AutoCloneTables = false,
 
 		-- How long to wait for player data to load before timing out (in seconds)
 		DataWaitTimeout = 10,
@@ -68,7 +72,10 @@ local Config = {
 		
 		-- Maximum number of cached path strings before cleanup
 		MaxPathCacheSize = 1000,
+
+		-- If enabled, Get/GetPath/GetFromDict will return deep copies of tables instead of references
+		AutoCloneTables = false,
 	},
 }
 
-return Config 
+return Config

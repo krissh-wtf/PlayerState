@@ -34,6 +34,7 @@ export type PlayerStateClient = {
 	Get: (key: string) -> any,
 	GetPath: (path: ValuePath) -> any,
 	GetFromDict: (dictPath: ValuePath, key: string | number) -> any,
+	Clone: (value: any, deep: boolean?) -> any,
 	OnChanged: (pathOrKey: string, callback: (newValue: any, oldValue: any, info: ChangeInfo | {string}?) -> ()) -> ReplicaClient.Connection?,
 	GetReplica: () -> ReplicaInstance?,
 	GetAll: () -> PlayerData?,
@@ -52,6 +53,7 @@ local nestedValueCache: {[string]: {value: any, timestamp: number}} = {}
 local CACHE_DURATION = Config.Client.CacheDuration
 local lastCacheCleanup = 0
 local CACHE_CLEANUP_INTERVAL = Config.Client.CacheCleanupInterval
+local AUTO_CLONE_TABLES = Config.Client.AutoCloneTables
 
 -- Connection management
 local activeConnections: {ReplicaClient.Connection} = {}
@@ -101,6 +103,16 @@ local function _GetPathKeys(path: string): {string}
 	end
 
 	return keys
+end
+
+local function _DeepClone(value: any): any
+	local copy = {}
+
+	for key, entry in value do
+		copy[key] = if typeof(entry) == "table" then _DeepClone(entry) else entry
+	end
+
+	return copy
 end
 
 local function _GetNestedValue(data: any, path: string): any
@@ -216,16 +228,36 @@ function PlayerState.Get(key: string): any
 	local currentTime = tick()
 	local cached = valueCache[key]
 	if cached and currentTime - cached.timestamp < CACHE_DURATION then
-		return cached.value
+		local cachedValue = cached.value
+		if AUTO_CLONE_TABLES and typeof(cachedValue) == "table" then
+			return _DeepClone(cachedValue)
+		end
+		return cachedValue
 	end
 
 	local value = (localReplica :: ReplicaInstance).Data[key]
+
+	if AUTO_CLONE_TABLES and typeof(value) == "table" then
+		value = _DeepClone(value)
+	end
 
 	valueCache[key] = {value = value, timestamp = currentTime}
 
 	_CleanupCache()
 
 	return value
+end
+
+function PlayerState.Clone(value: any, deep: boolean?): any
+	if typeof(value) ~= "table" then
+		return value
+	end
+
+	if deep then
+		return _DeepClone(value)
+	end
+
+	return table.clone(value)
 end
 
 function PlayerState.GetPath(path: ValuePath): any	
@@ -244,13 +276,18 @@ function PlayerState.GetPath(path: ValuePath): any
 
 	local replicaData = (localReplica :: ReplicaInstance).Data
 
+	local result
 	if not string.find(path, ".", 1, true) then
-		return replicaData[path]
+		result = replicaData[path]
+	else
+		result = _GetNestedValue(replicaData, path)
 	end
 
-	local result = _GetNestedValue(replicaData, path)
-
 	_CleanupCache()
+
+	if AUTO_CLONE_TABLES and typeof(result) == "table" then
+		return _DeepClone(result)
+	end
 
 	return result
 end
@@ -274,7 +311,13 @@ function PlayerState.GetFromDict(dictPath: ValuePath, key: string | number): any
 
 	_CleanupCache()
 
-	return currentDict[stringKey]
+	local result = currentDict[stringKey]
+
+	if AUTO_CLONE_TABLES and typeof(result) == "table" then
+		return _DeepClone(result)
+	end
+
+	return result
 end
 
 function PlayerState.OnChanged(pathOrKey: string, callback: (newValue: any, oldValue: any, fullPath: {string}?) -> ()): ReplicaClient.Connection?

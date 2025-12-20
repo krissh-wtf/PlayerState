@@ -34,6 +34,7 @@ export type ProfileStoreProfile = {
 	Reconcile: (self: ProfileStoreProfile) -> (),
 	EndSession: (self: ProfileStoreProfile) -> (),
 	IsActive: (self: ProfileStoreProfile) -> boolean,
+	MessageHandler: (self: ProfileStoreProfile, fn: (message: any, processed: () -> ()) -> ()) -> (),
 }
 
 export type ProfileStoreInstance = any
@@ -73,6 +74,7 @@ export type PlayerStateServer = {
 	SetInDict: (player: Player, dictPath: DictPath, key: string | number, value: any) -> boolean,
 	GetFromDict: (player: Player, dictPath: DictPath, key: string | number) -> any,
 	RemoveFromDict: (player: Player, dictPath: DictPath, key: string | number) -> boolean,
+	Clone: (value: any, deep: boolean?) -> any,
 	GetReplica: (player: Player) -> ReplicaInstance?,
 	GetProfile: (player: Player) -> ProfileStoreProfile?,
 	GetAll: (player: Player) -> PlayerData?,
@@ -115,6 +117,7 @@ export type ProfileUnloadedSignal = {
 
 -- Configuration (now centralized in PlayerStateConfig)
 local CONFIG = Config.Server
+local AUTO_CLONE_TABLES = CONFIG.AutoCloneTables
 
 -- Validate configuration for performance constraints
 if CONFIG.Leaderboard and CONFIG.Leaderboard.SyncInterval and CONFIG.Leaderboard.SyncInterval < 60 then
@@ -211,6 +214,16 @@ local function GetPathKeys(path: string): {string}
 	end
 
 	return keys
+end
+
+local function _DeepClone(value: any): any
+	local copy = {}
+
+	for key, entry in value do
+		copy[key] = if typeof(entry) == "table" then _DeepClone(entry) else entry
+	end
+
+	return copy
 end
 
 local function _GetNestedValue(data: any, path: string): any
@@ -673,6 +686,18 @@ function PlayerState.Init(player: Player, existingData: PlayerData?): boolean
 		end)
 	end)
 
+	profile:MessageHandler(function(message, processed)
+		if message.Type == "SetData" then
+			PlayerState.SetPath(player, message.Path, message.Value)
+			processed()
+		elseif message.Type == "WipeData" then
+			for key, value in CONFIG.Profile.Template do
+				PlayerState.Set(player, key, value)
+			end
+			processed()
+		end
+	end)
+
 	if player:IsDescendantOf(Players) then
 		attach(profile)
 	else
@@ -723,7 +748,25 @@ function PlayerState.Get(player: Player, key: string): any
 		return nil
 	end
 
-	return (replica.Data :: any)[key]
+	local value = (replica.Data :: any)[key]
+
+	if AUTO_CLONE_TABLES and typeof(value) == "table" then
+		return _DeepClone(value)
+	end
+
+	return value
+end
+
+function PlayerState.Clone(value: any, deep: boolean?): any
+	if typeof(value) ~= "table" then
+		return value
+	end
+
+	if deep then
+		return _DeepClone(value)
+	end
+
+	return table.clone(value)
 end
 
 function PlayerState.SetPath(player: Player, path: ValuePath, value: any): boolean
@@ -764,11 +807,18 @@ function PlayerState.GetPath(player: Player, path: ValuePath): any
 		return nil
 	end
 
+	local result
 	if not string.find(path, ".", 1, true) then
-		return (replica.Data :: any)[path]
+		result = (replica.Data :: any)[path]
+	else
+		result = _GetNestedValue(replica.Data, path)
 	end
 
-	return _GetNestedValue(replica.Data, path)
+	if AUTO_CLONE_TABLES and typeof(result) == "table" then
+		return _DeepClone(result)
+	end
+
+	return result
 end
 
 function PlayerState.SetValues(player: Player, values: {[string]: any}): boolean
@@ -918,7 +968,13 @@ function PlayerState.GetFromDict(player: Player, dictPath: DictPath, key: string
 
 	local currentDict = PlayerState.GetPath(player, dictPath) or {}
 
-	return currentDict[stringKey]
+	local result = currentDict[stringKey]
+
+	if AUTO_CLONE_TABLES and typeof(result) == "table" then
+		return _DeepClone(result)
+	end
+
+	return result
 end
 
 function PlayerState.RemoveFromDict(player: Player, dictPath: DictPath, key: string | number): boolean
@@ -1012,13 +1068,31 @@ function PlayerState.SetOfflineData(userId: number, path: string, value: any): b
 		return false
 	end
 
-	for _, player in Players do
+	for _, player in Players:GetPlayers() do
 		if player.UserId == userId then
 			return PlayerState.SetPath(player, path, value)
 		end
 	end
 
 	local profileKey = CONFIG.Profile.Key .. "_" .. tostring(userId)
+
+	local offlineProfile = profileStore:GetAsync(profileKey)
+
+	if offlineProfile and offlineProfile.Session then
+		local success = profileStore:MessageAsync(profileKey, {
+			Type = "SetData",
+			Path = path,
+			Value = value,
+		})
+
+		if success then
+			print(`[PlayerState] Sent data change message to active profile for user {userId}`)
+			return true
+		else
+			warn(`[PlayerState] Failed to send message to active profile for user {userId}`)
+			return false
+		end
+	end
 
 	local success, profile = pcall(function()
 		return profileStore:StartSessionAsync(profileKey)
@@ -1112,13 +1186,29 @@ function PlayerState.WipeOfflinePlayerData(userId: number): boolean
 		return false
 	end
 
-	for _, player in (Players:GetPlayers()) do
+	for _, player in Players:GetPlayers() do
 		if player.UserId == userId then
 			return PlayerState.WipePlayerData(player)
 		end
 	end
 
 	local profileKey = CONFIG.Profile.Key .. "_" .. tostring(userId)
+
+	local offlineProfile = profileStore:GetAsync(profileKey)
+
+	if offlineProfile and offlineProfile.Session then
+		local success = profileStore:MessageAsync(profileKey, {
+			Type = "WipeData",
+		})
+
+		if success then
+			print(`[PlayerState] Sent wipe data message to active profile for user {userId}`)
+			return true
+		else
+			warn(`[PlayerState] Failed to send wipe message to active profile for user {userId}`)
+			return false
+		end
+	end
 
 	local success, profile = pcall(function()
 		return profileStore:StartSessionAsync(profileKey)
@@ -1376,4 +1466,4 @@ PlayerState.BeforeSave = BeforeSave
 PlayerState.ProfileLoaded = ProfileLoaded
 PlayerState.ProfileUnloaded = ProfileUnloaded
 
-return PlayerState 
+return PlayerState
