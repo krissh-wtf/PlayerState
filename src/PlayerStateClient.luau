@@ -24,6 +24,11 @@ local Config = require(script.Parent.PlayerStateConfig)
 export type PlayerData = typeof(DefaultData)
 export type ReplicaInstance = ReplicaClient.Replica
 export type ValuePath = string
+export type LeaderboardInfo = {
+	rank: number?,
+	score: number?,
+	statName: string,
+}
 export type ChangeInfo = {
 	action: "Set" | "SetValues" | "TableInsert" | "TableRemove",
 	path: {string},
@@ -40,6 +45,7 @@ export type PlayerStateClient = {
 	GetAll: () -> PlayerData?,
 	IsReady: () -> boolean,
 	ClearCache: () -> (),
+	GetLeaderboardInfo: (statName: string) -> LeaderboardInfo?,
 }
 
 -- States
@@ -453,8 +459,35 @@ end
 
 function PlayerState.ClearCache(): ()
 	table.clear(pathCache)
-	table.clear(valueCache)  
+	table.clear(valueCache)
 	table.clear(nestedValueCache)
 end
 
-return PlayerState 
+function PlayerState.GetLeaderboardInfo(statName: string): LeaderboardInfo?
+	if not _WaitForData() then
+		return nil
+	end
+
+	if not _ValidateReplica(localReplica) then
+		return nil
+	end
+
+	local replica = localReplica :: ReplicaInstance
+	local leaderboardRanks = (replica.Data :: any)._LeaderboardRanks
+	if typeof(leaderboardRanks) ~= "table" then
+		return nil
+	end
+
+	local statData = leaderboardRanks[statName]
+	if typeof(statData) ~= "table" then
+		return nil
+	end
+
+	return {
+		rank = statData.rank,
+		score = statData.score,
+		statName = statName,
+	}
+end
+
+return PlayerState

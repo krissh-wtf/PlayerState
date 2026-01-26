@@ -121,9 +121,9 @@ local AUTO_CLONE_TABLES = CONFIG.AutoCloneTables
 
 -- Validate configuration for performance constraints
 if CONFIG.Leaderboard and CONFIG.Leaderboard.SyncInterval and CONFIG.Leaderboard.SyncInterval < 60 then
-    warn("[PlayerState] SyncInterval should be >= 60 seconds for optimal performance. Setting to 60.")
+	warn("[PlayerState] SyncInterval should be >= 60 seconds for optimal performance. Setting to 60.")
 
-    CONFIG.Leaderboard.SyncInterval = 60
+	CONFIG.Leaderboard.SyncInterval = 60
 end
 
 -- IntValue limits 
@@ -388,15 +388,202 @@ local function _UpdateAllLeaderboards(): ()
 	end
 end
 
+local function _IsStatTracked(statName: string): boolean
+	if not CONFIG.Leaderboard or not CONFIG.Leaderboard.Enabled then
+		return false
+	end
+
+	for _, trackedStat in CONFIG.Leaderboard.TrackedStats do
+		if trackedStat == statName then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function _GetLeaderboardInternal(statName: string, limit: number): {LeaderboardEntry}
+	limit = limit or 100
+	
+	local store = leaderboardStores[statName]
+	if not store then
+		return {}
+	end
+
+	local cached = leaderboardCache[statName]
+	local currentTime = os.time()
+
+	if cached and (currentTime - cached.lastUpdate) < 15 then
+		return table.move(cached.data, 1, math.min(limit, #cached.data), 1, {})
+	end
+
+	local success, pages = pcall(function()
+		return store:GetSortedAsync(false, math.max(limit, 100))
+	end)
+
+	if not success then
+		if cached then
+			return table.move(cached.data, 1, math.min(limit, #cached.data), 1, {})
+		end
+		return {}
+	end
+
+	local topPlayers: {LeaderboardEntry} = {}
+	local data = pages:GetCurrentPage()
+
+	for i, entry in data do
+		local userId = tonumber(entry.key)
+		if userId then
+			topPlayers[#topPlayers + 1] = {
+				userId = userId,
+				score = entry.value,
+				rank = i,
+			}
+		end
+	end
+
+	leaderboardCache[statName] = {
+		data = topPlayers,
+		lastUpdate = currentTime,
+	}
+
+	return table.move(topPlayers, 1, math.min(limit, #topPlayers), 1, {})
+end
+
+local function _UpdateReplicaLeaderboardScore(replica: ReplicaInstance, statName: string, score: number): ()
+	if not _ValidateReplica(replica) then return end
+
+	local data = replica.Data :: any
+	local currentRanks = data._LeaderboardRanks
+	if typeof(currentRanks) ~= "table" then
+		currentRanks = {}
+	end
+
+	local currentStatRank = currentRanks[statName]
+	if typeof(currentStatRank) == "table" and currentStatRank.score == score then
+		return
+	end
+
+	local newRanks = table.clone(currentRanks :: any)
+	newRanks[statName] = {
+		rank = if typeof(currentStatRank) == "table" then currentStatRank.rank else nil,
+		score = score,
+	}
+
+	pcall(replica.Set, replica, {"_LeaderboardRanks"}, newRanks)
+end
+
+local function _SetupLeaderboardRankSaveProtection(profile: ProfileStoreProfile): ()
+	if not CONFIG.Leaderboard.Enabled then return end
+
+	local savedLeaderboardRanks: any = nil
+
+	local function restoreSavedLeaderboardRanks()
+		if savedLeaderboardRanks == nil then
+			return
+		end
+
+		local data = profile.Data :: any
+		if data._LeaderboardRanks == nil then
+			data._LeaderboardRanks = savedLeaderboardRanks
+		end
+
+		savedLeaderboardRanks = nil
+	end
+
+	local onSave = (profile :: any).OnSave
+	if onSave and onSave.Connect then
+		onSave:Connect(function()
+			local data = profile.Data :: any
+			savedLeaderboardRanks = data._LeaderboardRanks
+
+			if savedLeaderboardRanks ~= nil then
+				data._LeaderboardRanks = nil
+			end
+		end)
+	end
+
+	local onAfterSave = (profile :: any).OnAfterSave
+	if onAfterSave and onAfterSave.Connect then
+		onAfterSave:Connect(restoreSavedLeaderboardRanks)
+	end
+
+	profile.OnSessionEnd:Connect(restoreSavedLeaderboardRanks)
+end
+
+local function _SyncPlayerLeaderboardRanks(): ()
+	if not CONFIG.Leaderboard.Enabled then return end
+
+	for _, statName in CONFIG.Leaderboard.TrackedStats do
+		local leaderboard = _GetLeaderboardInternal(statName, 100)
+
+		local playerRanks: {[number]: {rank: number, score: number}} = {}
+		for _, entry in leaderboard do
+			playerRanks[entry.userId] = {
+				rank = entry.rank,
+				score = entry.score,
+			}
+		end
+
+		for _, player in Players:GetPlayers() do
+			if not _ValidatePlayer(player) then
+				continue
+			end
+
+			local replica = replicas[player]
+			if not _ValidateReplica(replica) then
+				continue
+			end
+
+			local rankInfo = playerRanks[player.UserId]
+			local currentRanks = (replica.Data :: any)._LeaderboardRanks
+			if typeof(currentRanks) ~= "table" then
+				currentRanks = {}
+			end
+			local currentStatRank = currentRanks[statName]
+
+			if rankInfo then
+				if typeof(currentStatRank) ~= "table"
+					or currentStatRank.rank ~= rankInfo.rank
+					or currentStatRank.score ~= rankInfo.score
+				then
+					local newRanks = table.clone(currentRanks)
+					newRanks[statName] = rankInfo
+					pcall(replica.Set, replica, {"_LeaderboardRanks"}, newRanks)
+				end
+			else
+				local value = _GetNestedValue(replica.Data, statName)
+				if typeof(value) == "number" then
+					if typeof(currentStatRank) ~= "table" or currentStatRank.score ~= value then
+						local newRanks = table.clone(currentRanks)
+						newRanks[statName] = {
+							rank = nil,
+							score = value,
+						}
+						pcall(replica.Set, replica, {"_LeaderboardRanks"}, newRanks)
+					end
+				end
+			end
+		end
+	end
+end
+
 local function _StartPeriodicUpdates(): ()
 	if periodicUpdateThread then
 		task.cancel(periodicUpdateThread)
+		periodicUpdateThread = nil
 	end
+
+	task.spawn(function()
+		_UpdateAllLeaderboards()
+		_SyncPlayerLeaderboardRanks()
+	end)
 
 	periodicUpdateThread = task.spawn(function()
 		while true do
 			task.wait(CONFIG.Leaderboard.SyncInterval)
 			_UpdateAllLeaderboards()
+			_SyncPlayerLeaderboardRanks()
 		end
 	end)
 end
@@ -583,12 +770,12 @@ end
 
 function PlayerState.Init(player: Player, existingData: PlayerData?): boolean
 	if not _ValidatePlayer(player) then return false end
-	
+
 	if profiles[player] or replicas[player] then
 		warn(`[PlayerState] {player.Name} already initialized`)
 		return false
 	end
-	
+
 	if existingData then
 		error("[PlayerState] existingData is not supported")
 	end
@@ -598,13 +785,15 @@ function PlayerState.Init(player: Player, existingData: PlayerData?): boolean
 		warn(`[PlayerState] Init already running for {player.Name}`)
 		return false
 	end
-	
+
 	initInFlight[player.UserId] = true
 
 	local profileKey = CONFIG.Profile.Key .. "_" .. player.UserId
 
 	local function attach(profile: ProfileStoreProfile)
 		profiles[player] = profile
+
+		_SetupLeaderboardRankSaveProtection(profile)
 
 		if replicas[player] then
 			pcall(replicas[player].Destroy, replicas[player])
@@ -648,36 +837,36 @@ function PlayerState.Init(player: Player, existingData: PlayerData?): boolean
 		local ok, profOrErr = pcall(function()
 			return profileStore:StartSessionAsync(profileKey)
 		end)
-		
+
 		if not ok or not profOrErr then
 			warn(`[PlayerState] StartSession failed for {player.Name}: {profOrErr}`)
 			return nil
 		end
-		
+
 		local prof: ProfileStoreProfile = profOrErr
 		prof:AddUserId(player.UserId)
 		prof:Reconcile()
-		
+
 		_CleanData(prof.Data, CONFIG.Profile.Template)
-		
+
 		return prof
 	end
-	
+
 	local profile = openSession()
 	if not profile then
 		initInFlight[player.UserId] = nil
 		player:Kick("Failed to load data - please rejoin")
-		
+
 		return false
 	end
 
 	profile.OnSessionEnd:Connect(function()
 		ProfileUnloaded:Fire(player, profile.Data)
-		
+
 		task.delay(2, function()
 			if not player:IsDescendantOf(Players) then return end
 			local newProfile = openSession()
-			
+
 			if newProfile then
 				attach(newProfile)
 			elseif player:IsDescendantOf(Players) then
@@ -703,7 +892,7 @@ function PlayerState.Init(player: Player, existingData: PlayerData?): boolean
 	else
 		profile:EndSession()
 		initInFlight[player.UserId] = nil
-		
+
 		return false
 	end
 
@@ -733,6 +922,10 @@ function PlayerState.Set(player: Player, key: string, value: any): boolean
 	if not success then
 		warn(`[PlayerState] Set operation failed for {player.Name}`)
 		return false
+	end
+
+	if _IsStatTracked(key) and typeof(value) == "number" then
+		_UpdateReplicaLeaderboardScore(replica, key, value :: number)
 	end
 
 	return true
@@ -781,11 +974,17 @@ function PlayerState.SetPath(player: Player, path: ValuePath, value: any): boole
 		return false
 	end
 
+	local shouldSyncLeaderboard = _IsStatTracked(path) and typeof(value) == "number"
+
 	if not string.find(path, ".", 1, true) then
 		local success = pcall(replica.Set, replica, {path}, value)
 		if not success then
 			warn(`[PlayerState] SetPath operation failed for {player.Name}`)
 			return false
+		end
+
+		if shouldSyncLeaderboard then
+			_UpdateReplicaLeaderboardScore(replica, path, value :: number)
 		end
 
 		return true
@@ -796,6 +995,10 @@ function PlayerState.SetPath(player: Player, path: ValuePath, value: any): boole
 	if not success then
 		warn(`[PlayerState] SetPath operation failed for {player.Name}`)
 		return false
+	end
+
+	if shouldSyncLeaderboard then
+		_UpdateReplicaLeaderboardScore(replica, path, value :: number)
 	end
 
 	return true
@@ -839,6 +1042,12 @@ function PlayerState.SetValues(player: Player, values: {[string]: any}): boolean
 	if not success then
 		warn(`[PlayerState] SetValues operation failed for {player.Name}`)
 		return false
+	end
+
+	for key, value in values do
+		if _IsStatTracked(key) and typeof(value) == "number" then
+			_UpdateReplicaLeaderboardScore(replica, key, value :: number)
+		end
 	end
 
 	return true
@@ -1172,11 +1381,11 @@ function PlayerState.WipePlayerData(player: Player): boolean
 	end
 
 	print(`[PlayerState] Successfully wiped data for {player.Name}`)
-	
+
 	if player:IsDescendantOf(Players) then
 		player:Kick("Your data has been reset. Please rejoin to continue.")
 	end
-	
+
 	return true
 end
 
@@ -1278,26 +1487,13 @@ function PlayerState.Decrement(player: Player, path: ValuePath, amount: number?)
 end
 
 -- ========== LEADERBOARD VALIDATION ==========
-local function IsStatTracked(statName: string): boolean
-	if not CONFIG.Leaderboard or not CONFIG.Leaderboard.TrackedStats then
-		return false
-	end
-
-	for _, trackedStat in CONFIG.Leaderboard.TrackedStats do
-		if trackedStat == statName then
-			return true
-		end
-	end
-	return false
-end
-
 function PlayerState.UpdateLeaderboard(player: Player, statName: string, score: number): boolean
 	if not CONFIG.Leaderboard or not CONFIG.Leaderboard.Enabled then
 		warn("[PlayerState] Leaderboard functionality is disabled")
 		return false
 	end
 
-	if not IsStatTracked(statName) then
+	if not _IsStatTracked(statName) then
 		warn(`[PlayerState] Stat "{statName}" is not configured as a tracked leaderboard stat. Add it to CONFIG.Leaderboard.TrackedStats`)
 		return false
 	end
@@ -1334,7 +1530,7 @@ function PlayerState.GetLeaderboard(statName: string, limit: number): {Leaderboa
 		return {}
 	end
 
-	if not IsStatTracked(statName) then
+	if not _IsStatTracked(statName) then
 		warn(`[PlayerState] Stat "{statName}" is not configured as a tracked leaderboard stat. Add it to CONFIG.Leaderboard.TrackedStats`)
 		return {}
 	end
@@ -1345,44 +1541,7 @@ function PlayerState.GetLeaderboard(statName: string, limit: number): {Leaderboa
 		return {}
 	end
 
-	local cached = leaderboardCache[statName]
-	local currentTime = os.time()
-
-	if cached and (currentTime - cached.lastUpdate) < 15 then
-		return table.move(cached.data, 1, math.min(limit, #cached.data), 1, {})
-	end
-
-	local success, pages = pcall(function()
-		return store:GetSortedAsync(false, math.max(limit, 100))
-	end)
-
-	if not success then
-		if cached then
-			return table.move(cached.data, 1, math.min(limit, #cached.data), 1, {})
-		end
-		return {}
-	end
-
-	local topPlayers = {}
-	local data = pages:GetCurrentPage()
-
-	for i, entry in (data) do
-		local userId = tonumber(entry.key)
-		if userId then
-			table.insert(topPlayers, {
-				userId = userId,
-				score = entry.value,
-				rank = i
-			})
-		end
-	end
-
-	leaderboardCache[statName] = {
-		data = topPlayers,
-		lastUpdate = currentTime
-	}
-
-	return table.move(topPlayers, 1, math.min(limit, #topPlayers), 1, {})
+	return _GetLeaderboardInternal(statName, limit)
 end
 
 function PlayerState.GetPlayerRank(player: Player, statName: string): number?
@@ -1390,7 +1549,7 @@ function PlayerState.GetPlayerRank(player: Player, statName: string): number?
 		return nil
 	end
 
-	if not IsStatTracked(statName) then
+	if not _IsStatTracked(statName) then
 		warn(`[PlayerState] Stat "{statName}" is not configured as a tracked leaderboard stat. Add it to CONFIG.Leaderboard.TrackedStats`)
 		return nil
 	end
