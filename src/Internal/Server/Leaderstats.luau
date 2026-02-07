@@ -31,8 +31,9 @@ function Leaderstats.CreateLeaderstats(player: Player, profileData: any, getNest
 		if typeof(currentValue) == "number" then
 			local valueType = GetAppropriateValueType(currentValue)
 			local valueObject = Instance.new(valueType)
+			local numericValue = valueObject :: any
 
-			valueObject.Value = currentValue
+			numericValue.Value = currentValue
 			valueObject.Name = displayName
 			valueObject.Parent = leaderstats
 		else
@@ -63,12 +64,14 @@ function Leaderstats.UpdateLeaderstatsForPath(player: Player, profileData: any, 
 					if currentType ~= requiredType then
 						valueObject:Destroy()
 						local newValueObject = Instance.new(requiredType)
+						local newNumericValue = newValueObject :: any
 
-						newValueObject.Value = newValue
+						newNumericValue.Value = newValue
 						newValueObject.Name = displayName
 						newValueObject.Parent = leaderstats
 					else
-						valueObject.Value = newValue
+						local numericValue = valueObject :: any
+						numericValue.Value = newValue
 					end
 				elseif valueObject:IsA("StringValue") then
 					(valueObject :: StringValue).Value = tostring(newValue or "")

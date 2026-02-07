@@ -86,7 +86,7 @@ function OfflineData.SetOfflineData(
 
 	cleanData(profile.Data, config.Profile.Template)
 
-	local success = pcall(function()
+	local setSuccess = pcall(function()
 		if not string.find(path, ".", 1, true) then
 			profile.Data[path] = value
 		else
@@ -107,7 +107,7 @@ function OfflineData.SetOfflineData(
 		end
 	end)
 
-	if not success then
+	if not setSuccess then
 		warn(`[PlayerState] Failed to set offline data for user {userId} at path {path}`)
 		profile:EndSession()
 		return false

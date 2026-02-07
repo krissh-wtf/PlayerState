@@ -6,21 +6,24 @@
 	Documentation: https://playerstate.netlify.app/api/client.html
 --]]
 
--- Services
 local RunService = game:GetService("RunService")
 
--- Validation
 local IS_CLIENT = RunService:IsClient()
 if not IS_CLIENT then
 	error("[PlayerStateClient] This module can only be used on the client")
 end
 
--- Libraries
 local DefaultData = require(script.Parent.DefaultData)
 local ReplicaClient = require(script.Parent.Replica.ReplicaClient)
 local Config = require(script.Parent.PlayerStateConfig)
 
--- Types
+local Utils = require(script.Parent.Internal.Shared.Utils)
+local CreatePathCache = require(script.Parent.Internal.Client.PathCache)
+local CreateCacheModule = require(script.Parent.Internal.Client.Cache)
+local Validation = require(script.Parent.Internal.Client.Validation)
+local Leaderboard = require(script.Parent.Internal.Client.Leaderboard)
+local CreateConnectionModule = require(script.Parent.Internal.Client.Connection)
+
 export type PlayerData = typeof(DefaultData)
 export type ReplicaInstance = ReplicaClient.Replica
 export type ValuePath = string
@@ -48,177 +51,66 @@ export type PlayerStateClient = {
 	GetLeaderboardInfo: (statName: string) -> LeaderboardInfo?,
 }
 
--- States
 local localReplica: ReplicaInstance?
 local dataReady: boolean = false
 
--- Caching (configuration from PlayerStateConfig)
-local pathCache: {[string]: {string}} = {}
-local valueCache: {[string]: {value: any, timestamp: number}} = {}
-local nestedValueCache: {[string]: {value: any, timestamp: number}} = {}
-local CACHE_DURATION = Config.Client.CacheDuration
-local lastCacheCleanup = 0
-local CACHE_CLEANUP_INTERVAL = Config.Client.CacheCleanupInterval
+local PathCacheModule = CreatePathCache(Config.Client.MaxPathCacheSize)
+local CacheModule = CreateCacheModule(Config.Client.CacheDuration, Config.Client.CacheCleanupInterval)
+local ConnectionModule = CreateConnectionModule()
 local AUTO_CLONE_TABLES = Config.Client.AutoCloneTables
 
--- Connection management
-local activeConnections: {ReplicaClient.Connection} = {}
-local connectionCleanupScheduled = false
-
--- Replica setup
 ReplicaClient.OnNew("PlayerData", function(replica)
 	localReplica = replica
 	dataReady = true
 
-	table.clear(valueCache)
-	table.clear(nestedValueCache)
+	CacheModule.ClearAllCaches()
 
 	print("[PlayerState] Client data is ready")
 end)
 ReplicaClient.RequestData()
 
--- ========== UTILITIES ==========
-local function _GetPathKeys(path: string): {string}
-	local cached = pathCache[path]
-	if cached then
+local function GetNestedValue(data: any, path: string): any
+	local cached = CacheModule.GetFromNestedCache(path)
+	if cached ~= nil then
 		return cached
 	end
 
-	local keys = string.split(path, ".")
-	pathCache[path] = keys
-
-	local cacheSize = 0
-	for _ in pathCache do
-		cacheSize += 1
-	end
-
-	if cacheSize > Config.Client.MaxPathCacheSize then
-		local keysToRemove = {}
-		local count = 0
-		for cachedPath in pathCache do
-			table.insert(keysToRemove, cachedPath)
-			count += 1
-			if count > 100 then
-				break
-			end
-		end
-
-		for _, keyToRemove in keysToRemove do
-			pathCache[keyToRemove] = nil
-		end
-	end
-
-	return keys
-end
-
-local function _DeepClone(value: any): any
-	local copy = {}
-
-	for key, entry in value do
-		copy[key] = if typeof(entry) == "table" then _DeepClone(entry) else entry
-	end
-
-	return copy
-end
-
-local function _GetNestedValue(data: any, path: string): any
-	local currentTime = tick()
-	local cached = nestedValueCache[path]
-	if cached and currentTime - cached.timestamp < CACHE_DURATION then
-		return cached.value
-	end
-
-	local keys = _GetPathKeys(path)
+	local keys = PathCacheModule.GetPathKeys(path)
 	local current = data
 
 	for _, key in keys do
 		if typeof(current) ~= "table" or current[key] == nil then
-			nestedValueCache[path] = {value = nil, timestamp = currentTime}
+			CacheModule.SetInNestedCache(path, nil)
 			return nil
 		end
 		current = current[key]
 	end
 
-	nestedValueCache[path] = {value = current, timestamp = currentTime}
+	CacheModule.SetInNestedCache(path, current)
 
 	return current
 end
 
-local function _CleanupCache(): ()
-	local currentTime = tick()
-
-	if currentTime - lastCacheCleanup < CACHE_CLEANUP_INTERVAL then
-		return
-	end
-
-	lastCacheCleanup = currentTime
-
-	local keysToRemove = {}
-
-	for key, cached in valueCache do
-		if currentTime - cached.timestamp > CACHE_DURATION * 10 then
-			table.insert(keysToRemove, key)
+local function WaitForData(): boolean
+	return Validation.WaitForData(
+		function()
+			return dataReady
+		end,
+		Validation.ValidateReplica,
+		function()
+			return localReplica
 		end
-	end
-
-	for _, key in keysToRemove do
-		valueCache[key] = nil
-	end
-
-	table.clear(keysToRemove)
-
-	for key, cached in nestedValueCache do
-		if currentTime - cached.timestamp > CACHE_DURATION * 10 then
-			table.insert(keysToRemove, key)
-		end
-	end
-
-	for _, key in keysToRemove do
-		nestedValueCache[key] = nil
-	end
+	)
 end
 
-local function _ValidateReplica(replica: ReplicaInstance?): boolean
-	return replica ~= nil and replica:IsActive()
-end
-
-local function _WaitForData(): boolean
-	while not (dataReady and _ValidateReplica(localReplica)) do
-		task.wait(0.1)
-	end
-
-	return true
-end
-
-local function _ScheduleConnectionCleanup(): ()
-	if connectionCleanupScheduled then
-		return
-	end
-
-	connectionCleanupScheduled = true
-	task.defer(function()
-		connectionCleanupScheduled = false
-
-		local validConnections = {}
-		for _, connection in activeConnections do
-			if typeof(connection) == "table" and connection.Disconnect then
-				table.insert(validConnections, connection)
-			end
-		end
-
-		activeConnections = validConnections
-	end)
-end
-
--- ========== CLIENT IMPLEMENTATION ==========
 local PlayerState: PlayerStateClient = {} :: PlayerStateClient
 
 function PlayerState.Get(key: string): any
-	if not _WaitForData() then
+	if not WaitForData() then
 		return nil
 	end
 
-	if not _ValidateReplica(localReplica) then
+	if not Validation.ValidateReplica(localReplica) then
 		return nil
 	end
 
@@ -231,12 +123,10 @@ function PlayerState.Get(key: string): any
 		return false
 	end
 
-	local currentTime = tick()
-	local cached = valueCache[key]
-	if cached and currentTime - cached.timestamp < CACHE_DURATION then
-		local cachedValue = cached.value
+	local cachedValue = CacheModule.GetFromValueCache(key)
+	if cachedValue ~= nil then
 		if AUTO_CLONE_TABLES and typeof(cachedValue) == "table" then
-			return _DeepClone(cachedValue)
+			return Utils.DeepClone(cachedValue)
 		end
 		return cachedValue
 	end
@@ -244,12 +134,12 @@ function PlayerState.Get(key: string): any
 	local value = (localReplica :: ReplicaInstance).Data[key]
 
 	if AUTO_CLONE_TABLES and typeof(value) == "table" then
-		value = _DeepClone(value)
+		value = Utils.DeepClone(value)
 	end
 
-	valueCache[key] = {value = value, timestamp = currentTime}
+	CacheModule.SetInValueCache(key, value)
 
-	_CleanupCache()
+	CacheModule.CleanupCache()
 
 	return value
 end
@@ -260,18 +150,18 @@ function PlayerState.Clone(value: any, deep: boolean?): any
 	end
 
 	if deep then
-		return _DeepClone(value)
+		return Utils.DeepClone(value)
 	end
 
 	return table.clone(value)
 end
 
 function PlayerState.GetPath(path: ValuePath): any	
-	if not _WaitForData() then
+	if not WaitForData() then
 		return nil
 	end
 
-	if not _ValidateReplica(localReplica) then
+	if not Validation.ValidateReplica(localReplica) then
 		return nil
 	end
 
@@ -286,24 +176,24 @@ function PlayerState.GetPath(path: ValuePath): any
 	if not string.find(path, ".", 1, true) then
 		result = replicaData[path]
 	else
-		result = _GetNestedValue(replicaData, path)
+		result = GetNestedValue(replicaData, path)
 	end
 
-	_CleanupCache()
+	CacheModule.CleanupCache()
 
 	if AUTO_CLONE_TABLES and typeof(result) == "table" then
-		return _DeepClone(result)
+		return Utils.DeepClone(result)
 	end
 
 	return result
 end
 
 function PlayerState.GetFromDict(dictPath: ValuePath, key: string | number): any	
-	if not _WaitForData() then
+	if not WaitForData() then
 		return nil
 	end
 
-	if not _ValidateReplica(localReplica) then
+	if not Validation.ValidateReplica(localReplica) then
 		return nil
 	end
 
@@ -315,12 +205,12 @@ function PlayerState.GetFromDict(dictPath: ValuePath, key: string | number): any
 	local stringKey = if typeof(key) == "number" then tostring(key) else key
 	local currentDict = PlayerState.GetPath(dictPath) or {}
 
-	_CleanupCache()
+	CacheModule.CleanupCache()
 
 	local result = currentDict[stringKey]
 
 	if AUTO_CLONE_TABLES and typeof(result) == "table" then
-		return _DeepClone(result)
+		return Utils.DeepClone(result)
 	end
 
 	return result
@@ -328,7 +218,7 @@ end
 
 function PlayerState.OnChanged(pathOrKey: string, callback: (newValue: any, oldValue: any, fullPath: {string}?) -> ()): ReplicaClient.Connection?
 	local function createConnection(replica: ReplicaInstance): ReplicaClient.Connection?
-		if not _ValidateReplica(replica) then
+		if not Validation.ValidateReplica(replica) then
 			return nil
 		end
 
@@ -336,8 +226,7 @@ function PlayerState.OnChanged(pathOrKey: string, callback: (newValue: any, oldV
 
 		if pathOrKey == "." then
 			connection = replica:OnChange(function(action, path, param1, param2)
-				table.clear(valueCache)
-				table.clear(nestedValueCache)
+				CacheModule.ClearAllCaches()
 
 				if action == "Set" then
 					local newValue, oldValue = param1, param2
@@ -354,7 +243,7 @@ function PlayerState.OnChanged(pathOrKey: string, callback: (newValue: any, oldV
 				end
 			end)
 		else
-			local pathKeys = _GetPathKeys(pathOrKey)
+			local pathKeys = PathCacheModule.GetPathKeys(pathOrKey)
 
 			connection = replica:OnChange(function(action, path, param1, param2)
 				local isExactMatch = #path == #pathKeys
@@ -373,8 +262,7 @@ function PlayerState.OnChanged(pathOrKey: string, callback: (newValue: any, oldV
 				end
 
 				if pathMatches then
-					table.clear(valueCache)
-					table.clear(nestedValueCache)
+					CacheModule.ClearAllCaches()
 
 					if action == "Set" then
 						if isExactMatch then
@@ -410,8 +298,7 @@ function PlayerState.OnChanged(pathOrKey: string, callback: (newValue: any, oldV
 		end
 
 		if connection then
-			table.insert(activeConnections, connection)
-			_ScheduleConnectionCleanup()
+			ConnectionModule.AddConnection(connection)
 		end
 
 		return connection
@@ -426,15 +313,14 @@ function PlayerState.OnChanged(pathOrKey: string, callback: (newValue: any, oldV
 			connection = createConnection(replica)
 		end)
 
-		table.insert(activeConnections, newReplicaConnection)
-		_ScheduleConnectionCleanup()
+		ConnectionModule.AddConnection(newReplicaConnection)
 
 		return connection
 	end
 end
 
 function PlayerState.GetReplica(): ReplicaInstance?
-	if not _ValidateReplica(localReplica) then
+	if not Validation.ValidateReplica(localReplica) then
 		return nil
 	end
 
@@ -442,11 +328,11 @@ function PlayerState.GetReplica(): ReplicaInstance?
 end
 
 function PlayerState.GetAll(): PlayerData?
-	if not _WaitForData() then
+	if not WaitForData() then
 		return nil
 	end
 
-	if not _ValidateReplica(localReplica) then
+	if not Validation.ValidateReplica(localReplica) then
 		return nil
 	end
 
@@ -454,40 +340,24 @@ function PlayerState.GetAll(): PlayerData?
 end
 
 function PlayerState.IsReady(): boolean
-	return dataReady and _ValidateReplica(localReplica)
+	return dataReady and Validation.ValidateReplica(localReplica)
 end
 
 function PlayerState.ClearCache(): ()
-	table.clear(pathCache)
-	table.clear(valueCache)
-	table.clear(nestedValueCache)
+	PathCacheModule.ClearCache()
+	CacheModule.ClearAllCaches()
 end
 
 function PlayerState.GetLeaderboardInfo(statName: string): LeaderboardInfo?
-	if not _WaitForData() then
+	if not WaitForData() then
 		return nil
 	end
 
-	if not _ValidateReplica(localReplica) then
+	if not Validation.ValidateReplica(localReplica) then
 		return nil
 	end
 
-	local replica = localReplica :: ReplicaInstance
-	local leaderboardRanks = (replica.Data :: any)._LeaderboardRanks
-	if typeof(leaderboardRanks) ~= "table" then
-		return nil
-	end
-
-	local statData = leaderboardRanks[statName]
-	if typeof(statData) ~= "table" then
-		return nil
-	end
-
-	return {
-		rank = statData.rank,
-		score = statData.score,
-		statName = statName,
-	}
+	return Leaderboard.GetLeaderboardInfo(localReplica, statName)
 end
 
 return PlayerState

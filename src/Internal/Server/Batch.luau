@@ -23,10 +23,11 @@ local function CreateBatchModule(config: any, getPathKeys: (path: string) -> {st
 		end
 
 		local replica = getReplica(player)
-		if not validateReplica(replica) then
+		if not replica or not validateReplica(replica) then
 			warn(`[PlayerState] Cannot process batch operations - invalid replica for {player.Name}`)
 			batchOperations[player] = nil
 			batchScheduled[player] = nil
+			
 			return
 		end
 

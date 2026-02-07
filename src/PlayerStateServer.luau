@@ -6,25 +6,32 @@
 	Documentation: https://playerstate.netlify.app/api/server.html
 --]]
 
--- Services
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
-local DataStoreService = game:GetService("DataStoreService")
 
--- Validation
 local IS_SERVER = RunService:IsServer()
 if not IS_SERVER then
 	error("[PlayerStateServer] This module can only be used on the server")
 end
 
--- Libraries  
 local DefaultData = require(script.Parent.DefaultData)
 local ProfileService = require(script.Parent.ProfileStore)
 local ReplicaServer = require(script.Parent.Replica.ReplicaServer)
 local Signal = require(script.Parent.Replica.Signal)
 local Config = require(script.Parent.PlayerStateConfig)
 
--- Types
+local CreatePathCache = require(script.Parent.Internal.Shared.PathCache)
+local Utils = require(script.Parent.Internal.Shared.Utils)
+local Validation = require(script.Parent.Internal.Server.Validation)
+local DataUtils = require(script.Parent.Internal.Server.DataUtils)
+local ArrayOps = require(script.Parent.Internal.Server.Array)
+local DictOps = require(script.Parent.Internal.Server.Dict)
+local CreateBatchModule = require(script.Parent.Internal.Server.Batch)
+local Leaderstats = require(script.Parent.Internal.Server.Leaderstats)
+local CreateLeaderboardModule = require(script.Parent.Internal.Server.Leaderboard)
+local OfflineData = require(script.Parent.Internal.Server.OfflineData)
+local DataWipe = require(script.Parent.Internal.Server.DataWipe)
+
 export type PlayerData = typeof(DefaultData)
 
 export type ProfileStoreProfile = {
@@ -50,6 +57,12 @@ export type BatchOperation = {
 	value: any,
 }
 
+export type BatchUpdateOperation = {
+	path: ValuePath,
+	operation: "Increment" | "Decrement",
+	amount: number?,
+}
+
 export type LeaderboardEntry = {
 	userId: number,
 	score: number,
@@ -65,6 +78,7 @@ export type PlayerStateServer = {
 	GetPath: (player: Player, path: ValuePath) -> any,
 	SetValues: (player: Player, values: {[string]: any}) -> boolean,
 	BatchSetValues: (player: Player, operations: {BatchOperation}) -> boolean,
+	BatchUpdateValues: (player: Player, operations: {BatchUpdateOperation}) -> boolean,
 	Increment: (player: Player, path: ValuePath, amount: number?) -> boolean,
 	Decrement: (player: Player, path: ValuePath, amount: number?) -> boolean,
 	FlushBatch: (player: Player) -> boolean,
@@ -88,71 +102,80 @@ export type PlayerStateServer = {
 	WipePlayerData: (player: Player) -> boolean,
 	WipeOfflinePlayerData: (userId: number) -> boolean,
 
-	-- Events
 	BeforeSave: BeforeSaveSignal,
 	ProfileLoaded: ProfileLoadedSignal,
 	ProfileUnloaded: ProfileUnloadedSignal,
 }
 
--- Event types
 export type Connection = {
 	Disconnect: (self: Connection) -> ()
 }
 export type Signal = {
 	Connect: (self: Signal, listener: (...any) -> ()) -> (Connection),
+	Fire: (self: Signal, ...any) -> (),
 	GetListenerCount: (self: Signal) -> (number),
 }
 export type BeforeSaveSignal = {
 	Connect: (self: BeforeSaveSignal, listener: (player: Player, data: PlayerData) -> ()) -> (Connection),
+	Fire: (self: BeforeSaveSignal, player: Player, data: PlayerData) -> (),
 	GetListenerCount: (self: BeforeSaveSignal) -> (number),
 }
 export type ProfileLoadedSignal = {
 	Connect: (self: ProfileLoadedSignal, listener: (player: Player, data: PlayerData) -> ()) -> (Connection),
+	Fire: (self: ProfileLoadedSignal, player: Player, data: PlayerData) -> (),
 	GetListenerCount: (self: ProfileLoadedSignal) -> (number),
 }
 export type ProfileUnloadedSignal = {
 	Connect: (self: ProfileUnloadedSignal, listener: (player: Player, data: PlayerData) -> ()) -> (Connection),
+	Fire: (self: ProfileUnloadedSignal, player: Player, data: PlayerData) -> (),
 	GetListenerCount: (self: ProfileUnloadedSignal) -> (number),
 }
 
--- Configuration (now centralized in PlayerStateConfig)
 local CONFIG = Config.Server
 local AUTO_CLONE_TABLES = CONFIG.AutoCloneTables
 
--- Validate configuration for performance constraints
 if CONFIG.Leaderboard and CONFIG.Leaderboard.SyncInterval and CONFIG.Leaderboard.SyncInterval < 60 then
 	warn("[PlayerState] SyncInterval should be >= 60 seconds for optimal performance. Setting to 60.")
 
 	CONFIG.Leaderboard.SyncInterval = 60
 end
 
--- IntValue limits 
-local INT32_MAX = 2147483647
-local INT32_MIN = -2147483648
-
--- States
 local replicas: { [Player]: ReplicaInstance } = {}
 local profiles: { [Player]: ProfileStoreProfile } = {}
 local initInFlight: {[number]: boolean} = {}
 local profileStore: ProfileStoreInstance
 
--- Events
 local BeforeSave = Signal.New() :: BeforeSaveSignal
 local ProfileLoaded = Signal.New() :: ProfileLoadedSignal
 local ProfileUnloaded = Signal.New() :: ProfileUnloadedSignal
 
--- Performance
-local pathCache: {[string]: {string}} = {}
-local pathCacheSize: number = 0  -- Track cache size for O(1) lookup
-local batchOperations: {[Player]: {BatchOperation}} = {}
-local batchScheduled: {[Player]: thread?} = {}
+local PathCacheModule = CreatePathCache(CONFIG.MaxCacheSize)
+local GetPathKeys = PathCacheModule.GetPathKeys
 
--- Leaderboard
-local leaderboardStores: {[string]: any} = {} -- {statName = OrderedDataStore, ...}
-local leaderboardCache: {[string]: {data: {LeaderboardEntry}, lastUpdate: number}} = {} -- {statName = {data, lastUpdate}, ...}
-local periodicUpdateThread: thread?
+local function GetNestedValue(data: any, path: string): any
+	local keys = GetPathKeys(path)
+	return DataUtils.GetNestedValue(data, keys)
+end
 
--- Replica setup
+local BatchModule = CreateBatchModule(
+	CONFIG,
+	GetPathKeys,
+	Validation.ValidateReplica,
+	function(player: Player)
+		return replicas[player]
+	end
+)
+
+local LeaderboardModule = CreateLeaderboardModule(
+	CONFIG,
+	Validation.ValidatePlayer,
+	Validation.ValidateReplica,
+	function()
+		return replicas
+	end,
+	GetNestedValue
+)
+
 local PlayerDataToken = ReplicaServer.Token("PlayerData")
 
 profileStore = ProfileService.New(
@@ -165,559 +188,16 @@ if CONFIG.DataStore.Scope == "Testing" then
 	print("[PlayerState] Testing Scope: Using ProfileStore with mock data")
 end
 
--- ========== LEADERBOARD INITIALIZATION ==========
-local function InitializeLeaderboards()
-	if not CONFIG.Leaderboard.Enabled then return end
+LeaderboardModule.InitializeLeaderboards()
 
-	for _, statName in (CONFIG.Leaderboard.TrackedStats) do
-		local storeName = CONFIG.Leaderboard.DataStoreName .. "_" .. statName:gsub("%.", "_")
-		leaderboardStores[statName] = DataStoreService:GetOrderedDataStore(storeName)
-	end
-end
-
-InitializeLeaderboards()
-
--- ========== UTILITIES ==========
-local function _GetAppropriateValueType(value: number): string
-	if value % 1 ~= 0 then
-		return "NumberValue"
-	elseif value > INT32_MAX or value < INT32_MIN then
-		return "NumberValue"
-	else
-		return "IntValue"
-	end
-end
-
-local function GetPathKeys(path: string): {string}
-	local cached = pathCache[path]
-	if cached then
-		return cached
-	end
-
-	local keys = string.split(path, ".")
-	pathCache[path] = keys
-	pathCacheSize += 1
-
-	if pathCacheSize > CONFIG.MaxCacheSize then
-		local clearCount = math.floor(CONFIG.MaxCacheSize * 0.2)
-		local cleared = 0
-
-		for cachedPath in pathCache do
-			pathCache[cachedPath] = nil
-			cleared += 1
-			if cleared >= clearCount then
-				break
-			end
-		end
-
-		pathCacheSize -= cleared
-	end
-
-	return keys
-end
-
-local function _DeepClone(value: any): any
-	local copy = {}
-
-	for key, entry in value do
-		copy[key] = if typeof(entry) == "table" then _DeepClone(entry) else entry
-	end
-
-	return copy
-end
-
-local function _GetNestedValue(data: any, path: string): any
-	local keys = GetPathKeys(path)
-	local current = data
-
-
-	for i = 1, #keys do
-		local key = keys[i]
-		if typeof(current) ~= "table" then
-			return nil
-		end
-		current = current[key]
-		if current == nil then
-			return nil
-		end
-	end
-
-	return current
-end
-
-local function _ValidatePlayer(player: Player): boolean
-	return player and player.Parent == Players
-end
-
-local function _ValidateReplica(replica: ReplicaInstance?): boolean
-	return replica ~= nil and replica:IsActive()
-end
-
-local function _ValidateProfile(profile: ProfileStoreProfile?): boolean
-	return profile ~= nil and profile:IsActive()
-end
-
--- ========== DATA UTILITIES ==========
-local function _CleanData(data: any, template: any): ()
-	if not CONFIG.CleanExtraFields then return end
-
-	for key in data do
-		if template[key] == nil then
-			data[key] = nil
-		elseif typeof(data[key]) == "table" and typeof(template[key]) == "table" then
-			if next(template[key]) == nil then
-				continue
-			end
-
-			_CleanData(data[key], template[key])
-		end
-	end
-end
-
--- ========== BATCH PROCESSING ==========
-local function _ProcessBatchOperations(player: Player): ()
-	local playerBatch = batchOperations[player]
-	if not playerBatch or #playerBatch == 0 then
-		return
-	end
-
-	local replica = replicas[player]
-	if not _ValidateReplica(replica) then
-		warn(`[PlayerState] Cannot process batch operations - invalid replica for {player.Name}`)
-		batchOperations[player] = nil
-		batchScheduled[player] = nil
-		return
-	end
-
-	local groupedOps: {[string]: {[string]: any}} = {}
-	local singleOps: {{path: {string}, value: any}} = {}
-	local rootLevelOps: {[string]: any} = {}
-
-	for i = 1, #playerBatch do
-		local operation = playerBatch[i]
-		local pathKeys = GetPathKeys(operation.path)
-
-		if #pathKeys == 1 then
-			rootLevelOps[pathKeys[1]] = operation.value
-		elseif #pathKeys == 2 then
-			local rootPath = pathKeys[1]
-			if not groupedOps[rootPath] then
-				groupedOps[rootPath] = {}
-			end
-			groupedOps[rootPath][pathKeys[2]] = operation.value
-		else
-			singleOps[#singleOps + 1] = {path = pathKeys, value = operation.value}
-		end
-	end
-
-	if next(rootLevelOps) then
-		local success = pcall(replica.SetValues, replica, {}, rootLevelOps)
-		if not success then
-			warn(`[PlayerState] Batch root SetValues failed for {player.Name}`)
-		end
-	end
-
-	for rootPath, values in groupedOps do
-		local success = pcall(replica.SetValues, replica, {rootPath}, values)
-		if not success then
-			warn(`[PlayerState] Batch grouped SetValues failed for {player.Name}`)
-		end
-	end
-
-	for i = 1, #singleOps do
-		local operation = singleOps[i]
-		local success = pcall(replica.Set, replica, operation.path, operation.value)
-		if not success then
-			warn(`[PlayerState] Batch Set failed for {player.Name}`)
-		end
-	end
-
-	batchOperations[player] = nil
-	batchScheduled[player] = nil
-end
-
-local function _ScheduleBatchOperation(player: Player, operation: BatchOperation): ()
-	local playerBatch = batchOperations[player]
-	if not playerBatch then
-		playerBatch = {}
-		batchOperations[player] = playerBatch
-	end
-
-	playerBatch[#playerBatch + 1] = operation
-
-	if #playerBatch >= CONFIG.BatchSize then
-		local scheduledThread = batchScheduled[player]
-		if scheduledThread then
-			task.cancel(scheduledThread)
-			batchScheduled[player] = nil
-		end
-		_ProcessBatchOperations(player)
-		return
-	end
-
-	if not batchScheduled[player] then
-		batchScheduled[player] = task.delay(CONFIG.BatchDelay, function()
-			_ProcessBatchOperations(player)
-		end)
-	end
-end
-
--- ========== LEADERBOARD PERIODIC PROCESSING ==========
-local function _UpdateAllLeaderboards(): ()
-	if not CONFIG.Leaderboard.Enabled then return end
-
-	for _, statName in CONFIG.Leaderboard.TrackedStats do
-		local store = leaderboardStores[statName]
-		if not store then continue end
-
-		for _, player in Players:GetPlayers() do
-			if not _ValidatePlayer(player) then continue end
-
-			local replica = replicas[player]
-			if not _ValidateReplica(replica) then continue end
-
-			local value = _GetNestedValue(replica.Data, statName)
-			if typeof(value) == "number" then
-				task.spawn(function()
-					pcall(function()
-						store:SetAsync(tostring(player.UserId), value)
-					end)
-				end)
-			end
-		end
-	end
-end
-
-local function _IsStatTracked(statName: string): boolean
-	if not CONFIG.Leaderboard or not CONFIG.Leaderboard.Enabled then
-		return false
-	end
-
-	for _, trackedStat in CONFIG.Leaderboard.TrackedStats do
-		if trackedStat == statName then
-			return true
-		end
-	end
-
-	return false
-end
-
-local function _GetLeaderboardInternal(statName: string, limit: number): {LeaderboardEntry}
-	limit = limit or 100
-	
-	local store = leaderboardStores[statName]
-	if not store then
-		return {}
-	end
-
-	local cached = leaderboardCache[statName]
-	local currentTime = os.time()
-
-	if cached and (currentTime - cached.lastUpdate) < 15 then
-		return table.move(cached.data, 1, math.min(limit, #cached.data), 1, {})
-	end
-
-	local success, pages = pcall(function()
-		return store:GetSortedAsync(false, math.max(limit, 100))
-	end)
-
-	if not success then
-		if cached then
-			return table.move(cached.data, 1, math.min(limit, #cached.data), 1, {})
-		end
-		return {}
-	end
-
-	local topPlayers: {LeaderboardEntry} = {}
-	local data = pages:GetCurrentPage()
-
-	for i, entry in data do
-		local userId = tonumber(entry.key)
-		if userId then
-			topPlayers[#topPlayers + 1] = {
-				userId = userId,
-				score = entry.value,
-				rank = i,
-			}
-		end
-	end
-
-	leaderboardCache[statName] = {
-		data = topPlayers,
-		lastUpdate = currentTime,
-	}
-
-	return table.move(topPlayers, 1, math.min(limit, #topPlayers), 1, {})
-end
-
-local function _UpdateReplicaLeaderboardScore(replica: ReplicaInstance, statName: string, score: number): ()
-	if not _ValidateReplica(replica) then return end
-
-	local data = replica.Data :: any
-	local currentRanks = data._LeaderboardRanks
-	if typeof(currentRanks) ~= "table" then
-		currentRanks = {}
-	end
-
-	local currentStatRank = currentRanks[statName]
-	if typeof(currentStatRank) == "table" and currentStatRank.score == score then
-		return
-	end
-
-	local newRanks = table.clone(currentRanks :: any)
-	newRanks[statName] = {
-		rank = if typeof(currentStatRank) == "table" then currentStatRank.rank else nil,
-		score = score,
-	}
-
-	pcall(replica.Set, replica, {"_LeaderboardRanks"}, newRanks)
-end
-
-local function _SetupLeaderboardRankSaveProtection(profile: ProfileStoreProfile): ()
-	if not CONFIG.Leaderboard.Enabled then return end
-
-	local savedLeaderboardRanks: any = nil
-
-	local function restoreSavedLeaderboardRanks()
-		if savedLeaderboardRanks == nil then
-			return
-		end
-
-		local data = profile.Data :: any
-		if data._LeaderboardRanks == nil then
-			data._LeaderboardRanks = savedLeaderboardRanks
-		end
-
-		savedLeaderboardRanks = nil
-	end
-
-	local onSave = (profile :: any).OnSave
-	if onSave and onSave.Connect then
-		onSave:Connect(function()
-			local data = profile.Data :: any
-			savedLeaderboardRanks = data._LeaderboardRanks
-
-			if savedLeaderboardRanks ~= nil then
-				data._LeaderboardRanks = nil
-			end
-		end)
-	end
-
-	local onAfterSave = (profile :: any).OnAfterSave
-	if onAfterSave and onAfterSave.Connect then
-		onAfterSave:Connect(restoreSavedLeaderboardRanks)
-	end
-
-	profile.OnSessionEnd:Connect(restoreSavedLeaderboardRanks)
-end
-
-local function _SyncPlayerLeaderboardRanks(): ()
-	if not CONFIG.Leaderboard.Enabled then return end
-
-	for _, statName in CONFIG.Leaderboard.TrackedStats do
-		local leaderboard = _GetLeaderboardInternal(statName, 100)
-
-		local playerRanks: {[number]: {rank: number, score: number}} = {}
-		for _, entry in leaderboard do
-			playerRanks[entry.userId] = {
-				rank = entry.rank,
-				score = entry.score,
-			}
-		end
-
-		for _, player in Players:GetPlayers() do
-			if not _ValidatePlayer(player) then
-				continue
-			end
-
-			local replica = replicas[player]
-			if not _ValidateReplica(replica) then
-				continue
-			end
-
-			local rankInfo = playerRanks[player.UserId]
-			local currentRanks = (replica.Data :: any)._LeaderboardRanks
-			if typeof(currentRanks) ~= "table" then
-				currentRanks = {}
-			end
-			local currentStatRank = currentRanks[statName]
-
-			if rankInfo then
-				if typeof(currentStatRank) ~= "table"
-					or currentStatRank.rank ~= rankInfo.rank
-					or currentStatRank.score ~= rankInfo.score
-				then
-					local newRanks = table.clone(currentRanks)
-					newRanks[statName] = rankInfo
-					pcall(replica.Set, replica, {"_LeaderboardRanks"}, newRanks)
-				end
-			else
-				local value = _GetNestedValue(replica.Data, statName)
-				if typeof(value) == "number" then
-					if typeof(currentStatRank) ~= "table" or currentStatRank.score ~= value then
-						local newRanks = table.clone(currentRanks)
-						newRanks[statName] = {
-							rank = nil,
-							score = value,
-						}
-						pcall(replica.Set, replica, {"_LeaderboardRanks"}, newRanks)
-					end
-				end
-			end
-		end
-	end
-end
-
-local function _StartPeriodicUpdates(): ()
-	if periodicUpdateThread then
-		task.cancel(periodicUpdateThread)
-		periodicUpdateThread = nil
-	end
-
-	task.spawn(function()
-		_UpdateAllLeaderboards()
-		_SyncPlayerLeaderboardRanks()
-	end)
-
-	periodicUpdateThread = task.spawn(function()
-		while true do
-			task.wait(CONFIG.Leaderboard.SyncInterval)
-			_UpdateAllLeaderboards()
-			_SyncPlayerLeaderboardRanks()
-		end
-	end)
-end
-
-local function _UpdatePlayerLeaderboard(player: Player): ()
-	if not CONFIG.Leaderboard.Enabled or not CONFIG.Leaderboard.UpdateOnPlayerLeave then return end
-	if not _ValidatePlayer(player) then return end
-
-	local replica = replicas[player]
-	if not _ValidateReplica(replica) then return end
-
-	for _, statName in CONFIG.Leaderboard.TrackedStats do
-		local store = leaderboardStores[statName]
-		if not store then continue end
-
-		local value = _GetNestedValue(replica.Data, statName)
-		if typeof(value) == "number" then
-			task.spawn(function()
-				pcall(function()
-					store:SetAsync(tostring(player.UserId), value)
-				end)
-			end)
-		end
-	end
-end
-
--- ========== LEADERSTATS UTILITIES ==========
-local function _CreateLeaderstats(player: Player, leaderstatsConfig: {[string]: string}): ()
-	local leaderstats = Instance.new("Folder")
-	leaderstats.Name = "leaderstats"
-	leaderstats.Parent = player
-
-	for displayName, dataPath in leaderstatsConfig do
-		local currentValue = _GetNestedValue(profiles[player].Data, dataPath)
-
-		if typeof(currentValue) == "number" then
-			local valueType = _GetAppropriateValueType(currentValue)
-			local valueObject = Instance.new(valueType)
-
-			valueObject.Value = currentValue
-			valueObject.Name = displayName
-			valueObject.Parent = leaderstats
-		else
-			local stringValue = Instance.new("StringValue")
-
-			stringValue.Value = tostring(currentValue or "")
-			stringValue.Name = displayName
-			stringValue.Parent = leaderstats
-		end
-	end
-end
-
-local function _UpdateLeaderstatsForPath(player: Player, path: string, newValue: any): ()
-	local leaderstats = player:FindFirstChild("leaderstats")
-	if not leaderstats then return end
-
-	local profile = profiles[player]
-	if not _ValidateProfile(profile) then return end
-
-	local leaderstatsConfig = (profile.Data :: any).leaderstats
-	if not leaderstatsConfig then return end
-
-	for displayName, configPath in leaderstatsConfig do
-		if configPath == path then
-			local valueObject = leaderstats:FindFirstChild(displayName)
-			if valueObject then
-				if typeof(newValue) == "number" then
-					local requiredType = _GetAppropriateValueType(newValue)
-					local currentType = valueObject.ClassName
-
-					if currentType ~= requiredType then
-						valueObject:Destroy()
-						local newValueObject = Instance.new(requiredType)
-
-						newValueObject.Value = newValue
-						newValueObject.Name = displayName
-						newValueObject.Parent = leaderstats
-					else
-						valueObject.Value = newValue
-					end
-				elseif valueObject:IsA("StringValue") then
-					(valueObject :: StringValue).Value = tostring(newValue or "")
-				end
-			end
-
-			break
-		end
-	end
-end
-
-local function _SetupLeaderstatsSync(player: Player, replica: ReplicaInstance): ()
-	local leaderstatsConfig = (replica.Data :: any).leaderstats
-	if not leaderstatsConfig then return end
-
-	_CreateLeaderstats(player, leaderstatsConfig)
-
-	local originalSet = replica.Set
-	local originalSetValues = replica.SetValues
-
-	replica.Set = function(self, path: {string}, value: any)
-		local success = pcall(originalSet, self, path, value)
-		if not success then
-			warn(`[PlayerState] Set operation failed for {player.Name}`)
-			return
-		end
-
-		local pathString = table.concat(path, ".")
-		_UpdateLeaderstatsForPath(player, pathString, value)
-	end
-
-	replica.SetValues = function(self, path: {string}, values: {[string]: any})
-		local success = pcall(originalSetValues, self, path, values)
-		if not success then
-			warn(`[PlayerState] SetValues operation failed for {player.Name}`)
-			return
-		end
-
-		local basePath = table.concat(path, ".")
-		for key, value in values do
-			local fullPath = basePath == "" and key or basePath .. "." .. key
-			_UpdateLeaderstatsForPath(player, fullPath, value)
-		end
-	end
-end
-
--- ========== SERVER IMPLEMENTATION ==========
 local PlayerState: PlayerStateServer = {} :: PlayerStateServer
 
 local function _WaitForPlayerData(player: Player, maxWaitTime: number?): boolean
-	maxWaitTime = maxWaitTime or CONFIG.DataWaitTimeout or 10
+	local waitTime: number = maxWaitTime or CONFIG.DataWaitTimeout or 10
 	local startTime = tick()
 
 	while not PlayerState.IsPlayerDataReady(player) do
-		if tick() - startTime > maxWaitTime then
+		if tick() - startTime > waitTime then
 			warn(`[PlayerState] Timeout waiting for {player.Name}'s data to load`)
 			return false
 		end
@@ -728,12 +208,12 @@ local function _WaitForPlayerData(player: Player, maxWaitTime: number?): boolean
 end
 
 local function _GetPlayerProfile(player: Player): ProfileStoreProfile?
-	if not _ValidatePlayer(player) then
+	if not Validation.ValidatePlayer(player) then
 		return nil
 	end
 
 	local profile = profiles[player]
-	if not _ValidateProfile(profile) then
+	if not Validation.ValidateProfile(profile) then
 		warn(`[PlayerState] No valid profile found for {player.Name}`)
 		return nil
 	end
@@ -742,12 +222,12 @@ local function _GetPlayerProfile(player: Player): ProfileStoreProfile?
 end
 
 local function _GetPlayerReplica(player: Player): ReplicaInstance?
-	if not _ValidatePlayer(player) then
+	if not Validation.ValidatePlayer(player) then
 		local profile = profiles[player]
-		if profile and _ValidateProfile(profile) then
+		if profile and Validation.ValidateProfile(profile) then
 			local replica = replicas[player]
 
-			if _ValidateReplica(replica) then
+			if Validation.ValidateReplica(replica) then
 				return replica
 			end
 		end
@@ -760,7 +240,7 @@ local function _GetPlayerReplica(player: Player): ReplicaInstance?
 	end
 
 	local replica = replicas[player]
-	if not _ValidateReplica(replica) then
+	if not Validation.ValidateReplica(replica) then
 		warn(`[PlayerState] No valid replica found for {player.Name}`)
 		return nil
 	end
@@ -769,7 +249,7 @@ local function _GetPlayerReplica(player: Player): ReplicaInstance?
 end
 
 function PlayerState.Init(player: Player, existingData: PlayerData?): boolean
-	if not _ValidatePlayer(player) then return false end
+	if not Validation.ValidatePlayer(player) then return false end
 
 	if profiles[player] or replicas[player] then
 		warn(`[PlayerState] {player.Name} already initialized`)
@@ -793,7 +273,7 @@ function PlayerState.Init(player: Player, existingData: PlayerData?): boolean
 	local function attach(profile: ProfileStoreProfile)
 		profiles[player] = profile
 
-		_SetupLeaderboardRankSaveProtection(profile)
+		LeaderboardModule.SetupLeaderboardRankSaveProtection(profile)
 
 		if replicas[player] then
 			pcall(replicas[player].Destroy, replicas[player])
@@ -809,7 +289,7 @@ function PlayerState.Init(player: Player, existingData: PlayerData?): boolean
 			replica:Subscribe(player)
 		else
 			local conn
-			conn = ReplicaServer.NewReadyPlayer:Connect(function(p)
+			conn = ReplicaServer.NewReadyPlayer:Connect(function(p: Player)
 				if p == player then
 					replica:Subscribe(player)
 					conn:Disconnect()
@@ -824,10 +304,18 @@ function PlayerState.Init(player: Player, existingData: PlayerData?): boolean
 			end)
 		end
 
-		_SetupLeaderstatsSync(player, replica)
+		Leaderstats.SetupLeaderstatsSync(
+			player,
+			replica,
+			function(p: Player)
+				return profiles[p]
+			end,
+			Validation.ValidateProfile,
+			GetNestedValue
+		)
 
 		if CONFIG.Leaderboard.Enabled then
-			_StartPeriodicUpdates()
+			LeaderboardModule.StartPeriodicUpdates()
 		end
 
 		ProfileLoaded:Fire(player, profile.Data)
@@ -847,7 +335,9 @@ function PlayerState.Init(player: Player, existingData: PlayerData?): boolean
 		prof:AddUserId(player.UserId)
 		prof:Reconcile()
 
-		_CleanData(prof.Data, CONFIG.Profile.Template)
+		if CONFIG.CleanExtraFields then
+			DataUtils.CleanData(prof.Data, CONFIG.Profile.Template)
+		end
 
 		return prof
 	end
@@ -881,7 +371,7 @@ function PlayerState.Init(player: Player, existingData: PlayerData?): boolean
 			processed()
 		elseif message.Type == "WipeData" then
 			for key, value in CONFIG.Profile.Template do
-				PlayerState.Set(player, key, value)
+				PlayerState.Set(player, key :: string, value)
 			end
 			processed()
 		end
@@ -924,8 +414,8 @@ function PlayerState.Set(player: Player, key: string, value: any): boolean
 		return false
 	end
 
-	if _IsStatTracked(key) and typeof(value) == "number" then
-		_UpdateReplicaLeaderboardScore(replica, key, value :: number)
+	if LeaderboardModule.IsStatTracked(key) and typeof(value) == "number" then
+		LeaderboardModule.UpdateReplicaLeaderboardScore(replica, key, value :: number)
 	end
 
 	return true
@@ -944,7 +434,7 @@ function PlayerState.Get(player: Player, key: string): any
 	local value = (replica.Data :: any)[key]
 
 	if AUTO_CLONE_TABLES and typeof(value) == "table" then
-		return _DeepClone(value)
+		return Utils.DeepClone(value)
 	end
 
 	return value
@@ -956,7 +446,7 @@ function PlayerState.Clone(value: any, deep: boolean?): any
 	end
 
 	if deep then
-		return _DeepClone(value)
+		return Utils.DeepClone(value)
 	end
 
 	return table.clone(value)
@@ -974,7 +464,7 @@ function PlayerState.SetPath(player: Player, path: ValuePath, value: any): boole
 		return false
 	end
 
-	local shouldSyncLeaderboard = _IsStatTracked(path) and typeof(value) == "number"
+	local shouldSyncLeaderboard = LeaderboardModule.IsStatTracked(path) and typeof(value) == "number"
 
 	if not string.find(path, ".", 1, true) then
 		local success = pcall(replica.Set, replica, {path}, value)
@@ -984,7 +474,7 @@ function PlayerState.SetPath(player: Player, path: ValuePath, value: any): boole
 		end
 
 		if shouldSyncLeaderboard then
-			_UpdateReplicaLeaderboardScore(replica, path, value :: number)
+			LeaderboardModule.UpdateReplicaLeaderboardScore(replica, path, value :: number)
 		end
 
 		return true
@@ -998,7 +488,7 @@ function PlayerState.SetPath(player: Player, path: ValuePath, value: any): boole
 	end
 
 	if shouldSyncLeaderboard then
-		_UpdateReplicaLeaderboardScore(replica, path, value :: number)
+		LeaderboardModule.UpdateReplicaLeaderboardScore(replica, path, value :: number)
 	end
 
 	return true
@@ -1014,11 +504,11 @@ function PlayerState.GetPath(player: Player, path: ValuePath): any
 	if not string.find(path, ".", 1, true) then
 		result = (replica.Data :: any)[path]
 	else
-		result = _GetNestedValue(replica.Data, path)
+		result = GetNestedValue(replica.Data, path)
 	end
 
 	if AUTO_CLONE_TABLES and typeof(result) == "table" then
-		return _DeepClone(result)
+		return Utils.DeepClone(result)
 	end
 
 	return result
@@ -1045,8 +535,8 @@ function PlayerState.SetValues(player: Player, values: {[string]: any}): boolean
 	end
 
 	for key, value in values do
-		if _IsStatTracked(key) and typeof(value) == "number" then
-			_UpdateReplicaLeaderboardScore(replica, key, value :: number)
+		if LeaderboardModule.IsStatTracked(key) and typeof(value) == "number" then
+			LeaderboardModule.UpdateReplicaLeaderboardScore(replica, key, value :: number)
 		end
 	end
 
@@ -1054,7 +544,7 @@ function PlayerState.SetValues(player: Player, values: {[string]: any}): boolean
 end
 
 function PlayerState.BatchSetValues(player: Player, operations: {BatchOperation}): boolean
-	if not _ValidatePlayer(player) then
+	if not Validation.ValidatePlayer(player) then
 		return false
 	end
 
@@ -1064,24 +554,63 @@ function PlayerState.BatchSetValues(player: Player, operations: {BatchOperation}
 			return false
 		end
 
-		_ScheduleBatchOperation(player, operation)
+		BatchModule.ScheduleBatchOperation(player, operation)
 	end
 
 	return true
 end
 
-function PlayerState.FlushBatch(player: Player): boolean
-	if not _ValidatePlayer(player) then
+function PlayerState.BatchUpdateValues(player: Player, operations: {BatchUpdateOperation}): boolean
+	if not Validation.ValidatePlayer(player) then
 		return false
 	end
 
-	local scheduledThread = batchScheduled[player]
-	if scheduledThread then
-		task.cancel(scheduledThread)
-		batchScheduled[player] = nil
+	local replica = _GetPlayerReplica(player)
+	if not replica then
+		return false
 	end
 
-	_ProcessBatchOperations(player)
+	local batchOperations: {BatchOperation} = {}
+
+	for _, op in operations do
+		local currentValue = PlayerState.GetPath(player, op.path)
+
+		if typeof(currentValue) ~= "number" then
+			warn(`[PlayerState] Cannot {op.operation} non-numeric value at path: {op.path}`)
+			return false
+		end
+
+		local amount = if op.amount ~= nil then op.amount else 1
+		local newValue: number
+
+		if op.operation == "Increment" then
+			newValue = currentValue + amount
+		elseif op.operation == "Decrement" then
+			newValue = currentValue - amount
+		else
+			warn(`[PlayerState] Invalid operation type: {op.operation}`)
+			return false
+		end
+
+		table.insert(batchOperations, {
+			path = op.path,
+			value = newValue,
+		})
+	end
+
+	local success = PlayerState.BatchSetValues(player, batchOperations)
+
+	BatchModule.FlushBatch(player)
+
+	return success
+end
+
+function PlayerState.FlushBatch(player: Player): boolean
+	if not Validation.ValidatePlayer(player) then
+		return false
+	end
+
+	BatchModule.FlushBatch(player)
 	return true
 end
 
@@ -1093,7 +622,7 @@ function PlayerState.AddToArray(player: Player, arrayPath: ArrayPath, item: any)
 	end
 
 	local pathKeys = GetPathKeys(arrayPath)
-	local success, result = pcall(replica.TableInsert, replica, pathKeys, item)
+	local success, result = ArrayOps.AddToArray(replica, pathKeys, item)
 	if not success then
 		warn(`[PlayerState] AddToArray operation failed for {player.Name}: {result}`)
 		return false
@@ -1110,7 +639,7 @@ function PlayerState.RemoveFromArray(player: Player, arrayPath: ArrayPath, index
 	end
 
 	local pathKeys = GetPathKeys(arrayPath)
-	local success, result = pcall(replica.TableRemove, replica, pathKeys, index)
+	local success, result = ArrayOps.RemoveFromArray(replica, pathKeys, index)
 	if not success then
 		warn(`[PlayerState] RemoveFromArray operation failed for {player.Name}: {result}`)
 		return false
@@ -1127,9 +656,7 @@ function PlayerState.UpdateArrayItem(player: Player, arrayPath: ArrayPath, index
 	end
 
 	local pathKeys = GetPathKeys(arrayPath)
-	table.insert(pathKeys, index)
-
-	local success = pcall(replica.Set, replica, pathKeys, newItem)
+	local success = ArrayOps.UpdateArrayItem(replica, pathKeys, index, newItem)
 	if not success then
 		warn(`[PlayerState] UpdateArrayItem operation failed for {player.Name}`)
 		return false
@@ -1153,10 +680,8 @@ function PlayerState.SetInDict(player: Player, dictPath: DictPath, key: string |
 		currentDict = {}
 	end
 
-	currentDict[stringKey] = value
-
 	local pathKeys = GetPathKeys(dictPath)
-	local success = pcall(replica.Set, replica, pathKeys, currentDict)
+	local success = DictOps.SetInDict(replica, pathKeys, currentDict, stringKey, value)
 
 	if not success then
 		warn(`[PlayerState] SetInDict operation failed for {player.Name}`)
@@ -1180,7 +705,7 @@ function PlayerState.GetFromDict(player: Player, dictPath: DictPath, key: string
 	local result = currentDict[stringKey]
 
 	if AUTO_CLONE_TABLES and typeof(result) == "table" then
-		return _DeepClone(result)
+		return Utils.DeepClone(result)
 	end
 
 	return result
@@ -1197,18 +722,11 @@ function PlayerState.RemoveFromDict(player: Player, dictPath: DictPath, key: str
 
 	local currentDict = PlayerState.GetPath(player, dictPath) or {}
 
-	if typeof(currentDict) ~= "table" then
-		warn(`[PlayerState] RemoveFromDict failed - path is not a dictionary for {player.Name}`)
-		return false
-	end
-
-	currentDict[stringKey] = nil
-
 	local pathKeys = GetPathKeys(dictPath)
-	local success = pcall(replica.Set, replica, pathKeys, currentDict)
+	local success = DictOps.RemoveFromDict(replica, pathKeys, currentDict, stringKey)
 
 	if not success then
-		warn(`[PlayerState] RemoveFromDict operation failed for {player.Name}`)
+		warn(`[PlayerState] RemoveFromDict failed - path is not a dictionary for {player.Name}`)
 		return false
 	end
 
@@ -1224,9 +742,9 @@ function PlayerState.GetProfile(player: Player): ProfileStoreProfile?
 end
 
 function PlayerState.GetAll(player: Player): PlayerData?
-	if not _ValidatePlayer(player) then
+	if not Validation.ValidatePlayer(player) then
 		local profile = profiles[player]
-		if profile and _ValidateProfile(profile) then
+		if profile and Validation.ValidateProfile(profile) then
 			return profile.Data
 		end
 		return nil
@@ -1241,215 +759,71 @@ function PlayerState.GetAll(player: Player): PlayerData?
 end
 
 function PlayerState.IsPlayerDataReady(player: Player): boolean
-	return _ValidatePlayer(player) and _ValidateProfile(profiles[player]) and _ValidateReplica(replicas[player])
+	return Validation.ValidatePlayer(player) and Validation.ValidateProfile(profiles[player]) and Validation.ValidateReplica(replicas[player])
 end
 
 function PlayerState.ClearPathCache(): ()
-	table.clear(pathCache)
-	pathCacheSize = 0
+	PathCacheModule.ClearCache()
 end
 
 function PlayerState.GetOfflineData(userId: number): PlayerData?
-	if not userId or userId < 1 then
-		warn("[PlayerState] Invalid userId for GetOfflineData")
-		return nil
-	end
-
-	for _, player in (Players:GetPlayers()) do
-		if player.UserId == userId then
+	return OfflineData.GetOfflineData(
+		userId,
+		CONFIG,
+		profileStore,
+		function(player: Player)
 			return PlayerState.GetAll(player)
 		end
-	end
-
-	local profileKey = CONFIG.Profile.Key .. "_" .. tostring(userId)
-	local offlineProfile = profileStore:GetAsync(profileKey)
-
-	if offlineProfile then
-		return offlineProfile.Data
-	end
-
-	return nil
+	)
 end
 
 function PlayerState.SetOfflineData(userId: number, path: string, value: any): boolean
-	if not userId or userId < 1 then
-		warn("[PlayerState] Invalid userId for SetOfflineData")
-		return false
-	end
-
-	for _, player in Players:GetPlayers() do
-		if player.UserId == userId then
-			return PlayerState.SetPath(player, path, value)
-		end
-	end
-
-	local profileKey = CONFIG.Profile.Key .. "_" .. tostring(userId)
-
-	local offlineProfile = profileStore:GetAsync(profileKey)
-
-	if offlineProfile and offlineProfile.Session then
-		local success = profileStore:MessageAsync(profileKey, {
-			Type = "SetData",
-			Path = path,
-			Value = value,
-		})
-
-		if success then
-			print(`[PlayerState] Sent data change message to active profile for user {userId}`)
-			return true
-		else
-			warn(`[PlayerState] Failed to send message to active profile for user {userId}`)
-			return false
-		end
-	end
-
-	local success, profile = pcall(function()
-		return profileStore:StartSessionAsync(profileKey)
-	end)
-
-	if not success or not profile then
-		warn(`[PlayerState] Failed to start profile session for offline user {userId}`)
-		return false
-	end
-
-	profile:AddUserId(userId)
-	profile:Reconcile()
-
-	_CleanData(profile.Data, CONFIG.Profile.Template)
-
-	local success = pcall(function()
-		if not string.find(path, ".", 1, true) then
-			profile.Data[path] = value
-		else
-			local pathKeys = GetPathKeys(path)
-			local current = profile.Data
-
-			for i = 1, #pathKeys - 1 do
-				local key = pathKeys[i]
-
-				if not current[key] then
-					current[key] = {}
-				end
-
-				current = current[key]
+	return OfflineData.SetOfflineData(
+		userId,
+		path,
+		value,
+		CONFIG,
+		profileStore,
+		function(player: Player, p: string, v: any)
+			return PlayerState.SetPath(player, p, v)
+		end,
+		GetPathKeys,
+		function(data: any, template: any)
+			if CONFIG.CleanExtraFields then
+				DataUtils.CleanData(data, template)
 			end
-
-			current[pathKeys[#pathKeys]] = value
 		end
-	end)
-
-	if not success then
-		warn(`[PlayerState] Failed to set offline data for user {userId} at path {path}`)
-		profile:EndSession()
-		return false
-	end
-
-	profile:Save()
-	profile:EndSession()
-
-	print(`[PlayerState] Successfully set offline data for user {userId}: {path} = {value}`)
-	return true
+	)
 end
 
 function PlayerState.WipePlayerData(player: Player): boolean
-	if not _ValidatePlayer(player) then
-		warn("[PlayerState] Cannot wipe data - invalid player")
-		return false
-	end
-
-	local profile = profiles[player]
-	if not _ValidateProfile(profile) then
-		warn(`[PlayerState] No valid profile found for {player.Name}`)
-		return false
-	end
-
-	local success = pcall(function()
-		table.clear(profile.Data)
-		for key, value in CONFIG.Profile.Template do
-			profile.Data[key] = value
-		end
-	end)
-
-	if not success then
-		warn(`[PlayerState] Failed to wipe data for {player.Name}`)
-		return false
-	end
-
-	local replica = replicas[player]
-	if _ValidateReplica(replica) then
-		pcall(replica.SetValues, replica, {}, profile.Data)
-	end
-
-	print(`[PlayerState] Successfully wiped data for {player.Name}`)
-
-	if player:IsDescendantOf(Players) then
-		player:Kick("Your data has been reset. Please rejoin to continue.")
-	end
-
-	return true
+	return DataWipe.WipePlayerData(
+		player,
+		CONFIG,
+		function(p: Player)
+			return profiles[p]
+		end,
+		function(p: Player)
+			return replicas[p]
+		end,
+		Validation.ValidatePlayer,
+		Validation.ValidateProfile,
+		Validation.ValidateReplica
+	)
 end
 
 function PlayerState.WipeOfflinePlayerData(userId: number): boolean
-	if not userId or userId < 1 then
-		warn("[PlayerState] Invalid userId for WipeOfflinePlayerData")
-		return false
-	end
-
-	for _, player in Players:GetPlayers() do
-		if player.UserId == userId then
-			return PlayerState.WipePlayerData(player)
+	return DataWipe.WipeOfflinePlayerData(
+		userId,
+		CONFIG,
+		profileStore,
+		PlayerState.WipePlayerData,
+		function(data: any, template: any)
+			if CONFIG.CleanExtraFields then
+				DataUtils.CleanData(data, template)
+			end
 		end
-	end
-
-	local profileKey = CONFIG.Profile.Key .. "_" .. tostring(userId)
-
-	local offlineProfile = profileStore:GetAsync(profileKey)
-
-	if offlineProfile and offlineProfile.Session then
-		local success = profileStore:MessageAsync(profileKey, {
-			Type = "WipeData",
-		})
-
-		if success then
-			print(`[PlayerState] Sent wipe data message to active profile for user {userId}`)
-			return true
-		else
-			warn(`[PlayerState] Failed to send wipe message to active profile for user {userId}`)
-			return false
-		end
-	end
-
-	local success, profile = pcall(function()
-		return profileStore:StartSessionAsync(profileKey)
-	end)
-
-	if not success or not profile then
-		warn(`[PlayerState] Failed to start profile session for offline userId {userId}`)
-		return false
-	end
-
-	profile:AddUserId(userId)
-	profile:Reconcile()
-
-	_CleanData(profile.Data, CONFIG.Profile.Template)
-
-	local success = pcall(function()
-		for key, value in CONFIG.Profile.Template do
-			profile.Data[key] = value
-		end
-	end)
-
-	if not success then
-		warn(`[PlayerState] Failed to wipe offline data for userId {userId}`)
-		profile:EndSession()
-		return false
-	end
-
-	profile:Save()
-	profile:EndSession()
-
-	print(`[PlayerState] Successfully wiped offline data for userId {userId}`)
-	return true
+	)
 end
 
 function PlayerState.SaveData(player: Player): boolean
@@ -1486,39 +860,25 @@ function PlayerState.Decrement(player: Player, path: ValuePath, amount: number?)
 	return PlayerState.Increment(player, path, -decrementAmount)
 end
 
--- ========== LEADERBOARD VALIDATION ==========
 function PlayerState.UpdateLeaderboard(player: Player, statName: string, score: number): boolean
 	if not CONFIG.Leaderboard or not CONFIG.Leaderboard.Enabled then
 		warn("[PlayerState] Leaderboard functionality is disabled")
 		return false
 	end
 
-	if not _IsStatTracked(statName) then
+	if not LeaderboardModule.IsStatTracked(statName) then
 		warn(`[PlayerState] Stat "{statName}" is not configured as a tracked leaderboard stat. Add it to CONFIG.Leaderboard.TrackedStats`)
 		return false
 	end
 
-	if not _ValidatePlayer(player) then
+	if not Validation.ValidatePlayer(player) then
 		return false
 	end
 
-	local store = leaderboardStores[statName]
+	local store = LeaderboardModule.GetLeaderboardInternal
 	if not store then
 		warn(`[PlayerState] No leaderboard store found for stat: {statName}`)
 		return false
-	end
-
-	local success = pcall(function()
-		store:SetAsync(tostring(player.UserId), score)
-	end)
-
-	if not success then
-		warn(`[PlayerState] Failed to update leaderboard for {player.Name} on stat {statName}`)
-		return false
-	end
-
-	if leaderboardCache[statName] then
-		leaderboardCache[statName] = nil
 	end
 
 	return true
@@ -1530,18 +890,12 @@ function PlayerState.GetLeaderboard(statName: string, limit: number): {Leaderboa
 		return {}
 	end
 
-	if not _IsStatTracked(statName) then
+	if not LeaderboardModule.IsStatTracked(statName) then
 		warn(`[PlayerState] Stat "{statName}" is not configured as a tracked leaderboard stat. Add it to CONFIG.Leaderboard.TrackedStats`)
 		return {}
 	end
 
-	local store = leaderboardStores[statName]
-	if not store then
-		warn(`[PlayerState] No leaderboard store found for stat: {statName} in PlayerStateConfig (Server.Leaderboard)`)
-		return {}
-	end
-
-	return _GetLeaderboardInternal(statName, limit)
+	return LeaderboardModule.GetLeaderboardInternal(statName, limit)
 end
 
 function PlayerState.GetPlayerRank(player: Player, statName: string): number?
@@ -1549,12 +903,12 @@ function PlayerState.GetPlayerRank(player: Player, statName: string): number?
 		return nil
 	end
 
-	if not _IsStatTracked(statName) then
+	if not LeaderboardModule.IsStatTracked(statName) then
 		warn(`[PlayerState] Stat "{statName}" is not configured as a tracked leaderboard stat. Add it to CONFIG.Leaderboard.TrackedStats`)
 		return nil
 	end
 
-	if not _ValidatePlayer(player) then
+	if not Validation.ValidatePlayer(player) then
 		return nil
 	end
 
@@ -1574,17 +928,9 @@ Players.PlayerRemoving:Connect(function(player)
 		BeforeSave:Fire(player, profiles[player].Data)
 	end
 
-	if batchOperations[player] then
-		_ProcessBatchOperations(player)
-		batchOperations[player] = nil
-	end
-	local scheduledThread = batchScheduled[player]
-	if scheduledThread then
-		task.cancel(scheduledThread)
-		batchScheduled[player] = nil
-	end
+	BatchModule.ClearPlayerBatch(player)
 
-	_UpdatePlayerLeaderboard(player)
+	LeaderboardModule.UpdatePlayerLeaderboard(player)
 
 	if profiles[player] then
 		profiles[player]:EndSession()
@@ -1604,15 +950,13 @@ game:BindToClose(function()
 		end
 	end
 
-	for player in batchOperations do
-		_ProcessBatchOperations(player)
+	for player in profiles do
+		BatchModule.ProcessBatchOperations(player)
 	end
 
-	if periodicUpdateThread then
-		task.cancel(periodicUpdateThread)
-	end
+	LeaderboardModule.CancelPeriodicUpdates()
 
-	_UpdateAllLeaderboards()
+	LeaderboardModule.UpdateAllLeaderboards()
 
 	for _, profile in profiles do
 		if profile then

@@ -100,13 +100,13 @@ function DataWipe.WipeOfflinePlayerData(
 
 	cleanData(profile.Data, config.Profile.Template)
 
-	local success = pcall(function()
+	local wipeSuccess = pcall(function()
 		for key, value in config.Profile.Template do
 			profile.Data[key] = value
 		end
 	end)
 
-	if not success then
+	if not wipeSuccess then
 		warn(`[PlayerState] Failed to wipe offline data for userId {userId}`)
 		profile:EndSession()
 		return false

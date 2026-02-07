@@ -21,10 +21,10 @@ function Array.RemoveFromArray(replica: any, pathKeys: {string}, index: number):
 end
 
 function Array.UpdateArrayItem(replica: any, pathKeys: {string}, index: number, newItem: any): boolean
-	local fullPath = table.clone(pathKeys)
+	local fullPath: {string | number} = table.clone(pathKeys)
 	table.insert(fullPath, index)
 
-	local success = pcall(replica.Set, replica, fullPath, newItem)
+	local success = pcall(replica.Set, replica, fullPath :: any, newItem)
 	return success
 end
 

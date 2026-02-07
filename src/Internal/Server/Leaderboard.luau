@@ -72,9 +72,11 @@ local function CreateLeaderboardModule(
 
 				local value = getNestedValue(replica.Data, statName)
 				if typeof(value) == "number" then
+					local storeValue = (value % 1 == 0) and value or math.floor(value)
+					
 					task.spawn(function()
 						pcall(function()
-							store:SetAsync(tostring(player.UserId), value)
+							store:SetAsync(tostring(player.UserId), storeValue)
 						end)
 					end)
 				end
@@ -283,9 +285,10 @@ local function CreateLeaderboardModule(
 
 			local value = getNestedValue(replica.Data, statName)
 			if typeof(value) == "number" then
+				local storeValue = (value % 1 == 0) and value or math.floor(value)
 				task.spawn(function()
 					pcall(function()
-						store:SetAsync(tostring(player.UserId), value)
+						store:SetAsync(tostring(player.UserId), storeValue)
 					end)
 				end)
 			end
