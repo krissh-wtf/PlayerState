@@ -12,17 +12,17 @@ local Config = {
 		Profile = {
 			-- Unique key for ProfileStore data identification
 			Key = "PlayerData",
-			
+
 			-- Data template/structure (automatically pulled from DefaultData)
 			Template = DefaultData,
 		},
-		
+
 		DataStore = {
 			-- DataStore name (change for different versions/environments)
-			Name = "PlayerData_0.01",
+			Name = "PlayerData_Testing",
 
 			-- Scope: "Production" for live data, "Testing" for mock data that won't save
-			Scope = "Production",
+			Scope = "Testing",
 		},
 
 		-- If it will remove fields not in template during data reconciliation
@@ -36,9 +36,9 @@ local Config = {
 		DataWaitTimeout = 10,
 
 		-- Batch processing settings
-		BatchDelay = 0.03,      -- Seconds to wait before processing batch (lower = faster, higher = more efficient)
-		BatchSize = 20,         -- Auto-flush batch when this many operations are queued
-		MaxCacheSize = 1000,    -- Maximum number of cached path keys
+		BatchDelay = 0.03, -- Seconds to wait before processing batch (lower = faster, higher = more efficient)
+		BatchSize = 20, -- Auto-flush batch when this many operations are queued
+		MaxCacheSize = 1000, -- Maximum number of cached path keys
 
 		Leaderboard = {
 			Enabled = true,
@@ -48,10 +48,9 @@ local Config = {
 
 			-- Which data fields should have leaderboards (auto-updated when values change)
 			TrackedStats = {
-				"Gems",
-				"Coins",
-				-- Add stat names here to create leaderboards
-				-- Examples: "coins", "level", "score", "Inventory.Pills"
+				"Wins",
+				"Overboards",
+				"Shells",
 			},
 
 			-- How often to sync leaderboard data (in seconds)
@@ -59,17 +58,17 @@ local Config = {
 			UpdateOnPlayerLeave = true, -- Always update leaderboards when player leaves
 		},
 	},
-	
+
 	Client = {
 		-- How long to cache values (in seconds)
 		CacheDuration = 0.1,
-		
-		-- How often to clean up expired cache entries (in seconds)  
+
+		-- How often to clean up expired cache entries (in seconds)
 		CacheCleanupInterval = 30,
-		
+
 		-- Maximum number of cached values before cleanup
 		MaxCacheSize = 1000,
-		
+
 		-- Maximum number of cached path strings before cleanup
 		MaxPathCacheSize = 1000,
 
